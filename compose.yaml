@@ -31,7 +31,7 @@ x-relay: &relay
     LOG_LEVEL: ${LOG_LEVEL:-info}
     ALLOW_PRIVATE_NETWORKS: ${ALLOW_PRIVATE_NETWORKS:-false}
     WORKER_CONCURRENCY: ${WORKER_CONCURRENCY:-64}
-    API_DB_CONNS: ${API_DB_CONNS:-16}
+    API_DB_CONNS: ${API_DB_CONNS:-48}
     WORKER_DB_CONNS: ${WORKER_DB_CONNS:-24}
     RETENTION: ${RETENTION:-720h}
     EMAIL_PROVIDER: ${EMAIL_PROVIDER:-log}
@@ -51,7 +51,7 @@ services:
       POSTGRES_DB: relay
     volumes:
       - pgdata:/var/lib/postgresql
-    command: ["postgres", "-c", "shared_buffers=96MB", "-c", "max_connections=80", "-c", "wal_compression=zstd",
+    command: ["postgres", "-c", "shared_buffers=96MB", "-c", "max_connections=120", "-c", "wal_compression=zstd",
               "-c", "log_min_duration_statement=500"]
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U relay -d relay"]

@@ -70,7 +70,7 @@ func Load() (Config, error) {
 		LogLevel:    e.str("LOG_LEVEL", "info"),
 
 		WorkerConcurrency:     e.int("WORKER_CONCURRENCY", 64),
-		APIDBConns:            e.int("API_DB_CONNS", 16),
+		APIDBConns:            e.int("API_DB_CONNS", 48),
 		WorkerDBConns:         e.int("WORKER_DB_CONNS", 24),
 		WebhookTimeout:        e.dur("WEBHOOK_TIMEOUT", 10*time.Second),
 		LeaseDuration:         e.dur("DELIVERY_LEASE", 60*time.Second),
