@@ -102,15 +102,22 @@ func serve(mode string) error {
 		_ = shutdownTracing(c)
 	}()
 
-	maxConns := int32(0)
+	// Separate pools: the API commits synchronously, the worker asynchronously (see store.Options).
+	var apiStore, workerStore *store.Store
+	if mode != "worker" {
+		if apiStore, err = store.Open(ctx, cfg.DatabaseURL, store.Options{MaxConns: int32(cfg.APIDBConns), Name: "relay-api"}); err != nil {
+			return err
+		}
+		defer apiStore.Close()
+	}
 	if mode != "api" {
-		maxConns = int32(min(cfg.WorkerConcurrency+8, 64))
+		if workerStore, err = store.Open(ctx, cfg.DatabaseURL, store.Options{
+			MaxConns: int32(cfg.WorkerDBConns), AsyncCommit: true, Name: "relay-worker",
+		}); err != nil {
+			return err
+		}
+		defer workerStore.Close()
 	}
-	st, err := store.Open(ctx, cfg.DatabaseURL, maxConns)
-	if err != nil {
-		return err
-	}
-	defer st.Close()
 	ropts, err := redis.ParseURL(cfg.RedisURL)
 	if err != nil {
 		return fmt.Errorf("REDIS_URL: %w", err)
@@ -132,10 +139,10 @@ func serve(mode string) error {
 	running := 0
 	if mode == "api" || mode == "all" {
 		running++
-		go func() { errc <- runAPI(ctx, cfg, st, q, log, m) }()
+		go func() { errc <- runAPI(ctx, cfg, apiStore, q, log, m) }()
 	}
 	if mode == "worker" || mode == "all" {
-		w, err := worker.New(cfg, st, q, log, m, worker.Options{})
+		w, err := worker.New(cfg, workerStore, q, log, m, worker.Options{})
 		if err != nil {
 			return err
 		}
@@ -239,7 +246,7 @@ func keys(args []string) error {
 		return err
 	}
 	ctx := context.Background()
-	st, err := store.Open(ctx, url, 2)
+	st, err := store.Open(ctx, url, store.Options{MaxConns: 2, Name: "relay-cli"})
 	if err != nil {
 		return err
 	}

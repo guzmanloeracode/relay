@@ -2,6 +2,7 @@
 package store
 
 import (
+	"cmp"
 	"context"
 	"database/sql"
 	"embed"
@@ -27,17 +28,30 @@ type Store struct {
 	Pool *pgxpool.Pool
 }
 
-// Open connects to PostgreSQL. maxConns 0 keeps pgx's default.
-func Open(ctx context.Context, url string, maxConns int32) (*Store, error) {
+// Options size the pool and choose the commit mode.
+type Options struct {
+	MaxConns int32 // 0 keeps pgx's default
+	// AsyncCommit turns synchronous_commit off for this pool. The worker uses it: a database crash can lose
+	// the last few hundred milliseconds of its writes, which only means those deliveries are routed or
+	// attempted again (at least once). The API keeps synchronous commits, so a 202 means the event is on disk.
+	AsyncCommit bool
+	Name        string // application_name, shown in pg_stat_activity
+}
+
+// Open connects to PostgreSQL.
+func Open(ctx context.Context, url string, o Options) (*Store, error) {
 	cfg, err := pgxpool.ParseConfig(url)
 	if err != nil {
 		return nil, fmt.Errorf("store: %w", err)
 	}
-	if maxConns > 0 {
-		cfg.MaxConns = maxConns
+	if o.MaxConns > 0 {
+		cfg.MaxConns = o.MaxConns
 	}
 	cfg.MaxConnIdleTime = 5 * time.Minute
-	cfg.ConnConfig.RuntimeParams["application_name"] = "relay"
+	cfg.ConnConfig.RuntimeParams["application_name"] = cmp.Or(o.Name, "relay")
+	if o.AsyncCommit {
+		cfg.ConnConfig.RuntimeParams["synchronous_commit"] = "off"
+	}
 	pool, err := pgxpool.NewWithConfig(ctx, cfg)
 	if err != nil {
 		return nil, fmt.Errorf("store: %w", err)

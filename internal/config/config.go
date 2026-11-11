@@ -23,6 +23,8 @@ type Config struct {
 	LogLevel    string
 
 	WorkerConcurrency int
+	APIDBConns        int // PostgreSQL connections of an API process
+	WorkerDBConns     int // PostgreSQL connections of a worker process
 	WebhookTimeout    time.Duration
 	LeaseDuration     time.Duration
 	RetryMaxAttempts  int
@@ -68,6 +70,8 @@ func Load() (Config, error) {
 		LogLevel:    e.str("LOG_LEVEL", "info"),
 
 		WorkerConcurrency:     e.int("WORKER_CONCURRENCY", 64),
+		APIDBConns:            e.int("API_DB_CONNS", 16),
+		WorkerDBConns:         e.int("WORKER_DB_CONNS", 24),
 		WebhookTimeout:        e.dur("WEBHOOK_TIMEOUT", 10*time.Second),
 		LeaseDuration:         e.dur("DELIVERY_LEASE", 60*time.Second),
 		RetryMaxAttempts:      e.int("RETRY_MAX_ATTEMPTS", 8),
@@ -112,6 +116,9 @@ func Load() (Config, error) {
 	}
 	if c.WorkerConcurrency < 1 || c.WorkerConcurrency > 1024 {
 		e.fail("WORKER_CONCURRENCY must be between 1 and 1024")
+	}
+	if c.APIDBConns < 1 || c.APIDBConns > 200 || c.WorkerDBConns < 1 || c.WorkerDBConns > 200 {
+		e.fail("API_DB_CONNS and WORKER_DB_CONNS must be between 1 and 200")
 	}
 	if c.RetryMaxAttempts < 1 || c.RetryMaxAttempts > 20 {
 		e.fail("RETRY_MAX_ATTEMPTS must be between 1 and 20")

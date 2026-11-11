@@ -86,7 +86,6 @@ CREATE TABLE events (
 -- Keys are released after 24 hours by the cleanup job, so the same key can be used again later.
 CREATE UNIQUE INDEX events_idempotency ON events (tenant_id, idempotency_key) WHERE idempotency_key IS NOT NULL;
 CREATE INDEX events_tenant ON events (tenant_id, id DESC);
-CREATE INDEX events_tenant_type ON events (tenant_id, type, id DESC);
 CREATE INDEX events_unrouted ON events (created_at) WHERE routed_at IS NULL;
 CREATE INDEX events_created ON events (created_at);
 

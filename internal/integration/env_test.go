@@ -180,7 +180,7 @@ func newEnv(t *testing.T, tweak func(*relayconfig.Config)) *env {
 		tweak(&cfg)
 	}
 
-	st, err := store.Open(ctx, dbURL, 40)
+	st, err := store.Open(ctx, dbURL, store.Options{MaxConns: 40})
 	if err != nil {
 		t.Fatal(err)
 	}
