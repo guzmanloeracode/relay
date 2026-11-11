@@ -74,6 +74,8 @@ assert s["bad_signatures"] == 0, "bad signatures"
 PY
 delivered="$(j "$key" "$api/v1/tenants/e2e/deliveries?status=delivered&limit=100" | field '["data"].__len__()')"
 [ "$delivered" = "$EVENTS" ] || { echo "e2e: the delivery log shows $delivered delivered"; exit 1; }
-curl -fsS "$api/openapi.yaml" | head -1 | grep -q 'openapi: 3.1' || { echo "e2e: no OpenAPI document"; exit 1; }
-curl -fsS "$api/readyz" | grep -q '"status":"ok"' || { echo "e2e: not ready"; exit 1; }
+spec="$(curl -fsS "$api/openapi.yaml")"
+[[ "$spec" == "openapi: 3.1"* ]] || { echo "e2e: no OpenAPI document"; exit 1; }
+ready="$(curl -fsS "$api/readyz")"
+[[ "$ready" == *'"status":"ok"'* ]] || { echo "e2e: not ready: $ready"; exit 1; }
 echo "e2e passed: $EVENTS events delivered and verified"
