@@ -220,6 +220,33 @@ func (q *Queue) Release(ctx context.Context, it Item) error {
 	return releaseScript.Run(ctx, q.rdb, keys, it.Delivery.String()).Err()
 }
 
+// Finish releases an attempt's slots and, when ack is true, acknowledges its stream entry, in one round trip.
+func (q *Queue) Finish(ctx context.Context, it Item, entryID string, ack bool) error {
+	keys := []string{
+		semKey("e", it.Endpoint), semKey("t", it.Tenant), parkKey("e", it.Endpoint), parkKey("t", it.Tenant),
+		parkedIndexKey, DeliveriesStream,
+	}
+	run := func() error {
+		_, err := q.rdb.Pipelined(ctx, func(p redis.Pipeliner) error {
+			releaseScript.EvalSha(ctx, p, keys, it.Delivery.String())
+			if ack {
+				p.XAck(ctx, DeliveriesStream, WorkerGroup, entryID)
+				p.XDel(ctx, DeliveriesStream, entryID)
+			}
+			return nil
+		})
+		return err
+	}
+	err := run()
+	if err != nil && strings.HasPrefix(err.Error(), "NOSCRIPT") {
+		if err := releaseScript.Load(ctx, q.rdb).Err(); err != nil {
+			return err
+		}
+		err = run()
+	}
+	return err
+}
+
 // Parked is one parking lot with deliveries waiting.
 type Parked struct {
 	Key   string

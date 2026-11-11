@@ -93,7 +93,7 @@ CREATE INDEX events_tenant ON events (tenant_id, id DESC);
 -- in Redis (with a lease), not by a write here: each attempt costs one UPDATE, when its result is recorded.
 CREATE TABLE deliveries (
     id               uuid PRIMARY KEY,
-    tenant_id        uuid        NOT NULL REFERENCES tenants (id) ON DELETE CASCADE,
+    tenant_id        uuid        NOT NULL, -- its event's tenant (no foreign key: the event's covers it)
     event_id         uuid        NOT NULL REFERENCES events (id) ON DELETE CASCADE,
     endpoint_id      uuid        NOT NULL REFERENCES endpoints (id) ON DELETE CASCADE,
     channel          text        NOT NULL,

@@ -165,8 +165,10 @@ func (w *Worker) dispatch(ctx context.Context, msgs []queue.Message, slots chan 
 		go func() {
 			defer w.inflight.Done()
 			recorded := w.attempt(ctx, e.it, row)
-			release(e.it)
-			done(e.msg, recorded)
+			if err := w.q.Finish(context.WithoutCancel(ctx), e.it, e.msg.ID, recorded); err != nil {
+				w.log.Warn("releasing delivery slot", "err", err)
+			}
+			<-slots
 		}()
 	}
 }
