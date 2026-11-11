@@ -11,7 +11,14 @@ can replay, and logs every attempt.
 Relay is written in Go, runs on PostgreSQL and Redis with Docker Compose, and is generic: any multi-tenant
 application can use it. [FieldOps](https://github.com/guzmanloeracode/fieldops) is its first client.
 
-<!-- LOADTEST-SUMMARY -->
+| Load test: Relay on 2 pinned vCPUs, 500 events/s for 2 minutes (two runs) | |
+|---|---|
+| Events accepted · failed | 495–497/s · **0 failed** |
+| Webhooks delivered (signed, verified, once) | 496–499/s · 0 duplicates · no backlog when the load stopped |
+| Ingest latency p50 · p95 · p99 | 21–34 ms · 79–156 ms · 187–281 ms ([why the p99 is above 50 ms](docs/LOADTEST.md#against-the-targets-prd-112)) |
+| Delivery lag p50 (event ingested → webhook received) | 26–38 ms |
+
+![Grafana during a 500 events/s load test](docs/images/grafana-loadtest.png)
 
 ## What it does
 
