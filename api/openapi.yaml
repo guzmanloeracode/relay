@@ -1020,7 +1020,7 @@ components:
 
     Event:
       type: object
-      required: [id, tenant, type, payload, message, targets, idempotency_key, created_at, routed_at, delivery_count]
+      required: [id, tenant, type, payload, message, targets, idempotency_key, created_at, delivery_count]
       properties:
         id: { type: string, pattern: "^evt_" }
         tenant: { type: string }
@@ -1036,8 +1036,7 @@ components:
             - { type: "null" }
         idempotency_key: { type: [string, "null"] }
         created_at: { $ref: "#/components/schemas/Timestamp" }
-        routed_at: { $ref: "#/components/schemas/NullableTimestamp" }
-        delivery_count: { type: integer, minimum: 0 }
+        delivery_count: { type: integer, minimum: 0, description: "Deliveries made when the event was stored (routing is part of ingestion)." }
 
     EventWithDeliveries:
       allOf:

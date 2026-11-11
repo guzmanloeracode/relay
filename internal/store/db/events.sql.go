@@ -7,7 +7,6 @@ package db
 
 import (
 	"context"
-	"encoding/json"
 	"time"
 
 	"github.com/google/uuid"
@@ -35,7 +34,7 @@ func (q *Queries) DeleteEventsBefore(ctx context.Context, arg DeleteEventsBefore
 }
 
 const getEvent = `-- name: GetEvent :one
-SELECT id, tenant_id, type, payload, message, targets, idempotency_key, request_hash, created_at, routed_at, delivery_count FROM events WHERE tenant_id = $1 AND id = $2
+SELECT id, tenant_id, type, payload, message, targets, idempotency_key, request_hash, created_at, delivery_count FROM events WHERE tenant_id = $1 AND id = $2
 `
 
 type GetEventParams struct {
@@ -56,7 +55,6 @@ func (q *Queries) GetEvent(ctx context.Context, arg GetEventParams) (Event, erro
 		&i.IdempotencyKey,
 		&i.RequestHash,
 		&i.CreatedAt,
-		&i.RoutedAt,
 		&i.DeliveryCount,
 	)
 	return i, err
@@ -84,105 +82,31 @@ func (q *Queries) GetEventByIdempotencyKey(ctx context.Context, arg GetEventById
 	return i, err
 }
 
-const getEventsToRoute = `-- name: GetEventsToRoute :many
-SELECT id, tenant_id, type, payload, message, targets, idempotency_key, request_hash, created_at, routed_at, delivery_count FROM events WHERE id = ANY($1::uuid[]) AND routed_at IS NULL
-`
-
-func (q *Queries) GetEventsToRoute(ctx context.Context, ids []uuid.UUID) ([]Event, error) {
-	rows, err := q.db.Query(ctx, getEventsToRoute, ids)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	items := []Event{}
-	for rows.Next() {
-		var i Event
-		if err := rows.Scan(
-			&i.ID,
-			&i.TenantID,
-			&i.Type,
-			&i.Payload,
-			&i.Message,
-			&i.Targets,
-			&i.IdempotencyKey,
-			&i.RequestHash,
-			&i.CreatedAt,
-			&i.RoutedAt,
-			&i.DeliveryCount,
-		); err != nil {
-			return nil, err
-		}
-		items = append(items, i)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	return items, nil
-}
-
-const insertEvent = `-- name: InsertEvent :one
-INSERT INTO events (id, tenant_id, type, payload, message, targets, idempotency_key, request_hash)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-ON CONFLICT (tenant_id, idempotency_key) WHERE idempotency_key IS NOT NULL DO NOTHING
-RETURNING id, created_at
-`
-
-type InsertEventParams struct {
-	ID             uuid.UUID
-	TenantID       uuid.UUID
-	Type           string
-	Payload        json.RawMessage
-	Message        json.RawMessage
-	Targets        json.RawMessage
-	IdempotencyKey *string
-	RequestHash    []byte
-}
-
-type InsertEventRow struct {
-	ID        uuid.UUID
-	CreatedAt time.Time
-}
-
-// Returns no row when the tenant already used this Idempotency-Key (the caller then loads that event).
-func (q *Queries) InsertEvent(ctx context.Context, arg InsertEventParams) (InsertEventRow, error) {
-	row := q.db.QueryRow(ctx, insertEvent,
-		arg.ID,
-		arg.TenantID,
-		arg.Type,
-		arg.Payload,
-		arg.Message,
-		arg.Targets,
-		arg.IdempotencyKey,
-		arg.RequestHash,
-	)
-	var i InsertEventRow
-	err := row.Scan(&i.ID, &i.CreatedAt)
-	return i, err
-}
-
 const insertEvents = `-- name: InsertEvents :many
-INSERT INTO events (id, tenant_id, type, payload, message, targets, idempotency_key, request_hash)
+INSERT INTO events (id, tenant_id, type, payload, message, targets, idempotency_key, request_hash, delivery_count)
 SELECT u.id, u.tenant_id, u.type, u.payload::jsonb, NULLIF(u.message, '')::jsonb, NULLIF(u.targets, '')::jsonb,
-       NULLIF(u.idem_key, ''), u.request_hash
+       NULLIF(u.idem_key, ''), u.request_hash, u.delivery_count
 FROM (
     SELECT unnest($1::uuid[]) AS id, unnest($2::uuid[]) AS tenant_id,
            unnest($3::text[]) AS type, unnest($4::text[]) AS payload,
            unnest($5::text[]) AS message, unnest($6::text[]) AS targets,
-           unnest($7::text[]) AS idem_key, unnest($8::bytea[]) AS request_hash
+           unnest($7::text[]) AS idem_key, unnest($8::bytea[]) AS request_hash,
+           unnest($9::int[]) AS delivery_count
 ) AS u
 ON CONFLICT (tenant_id, idempotency_key) WHERE idempotency_key IS NOT NULL DO NOTHING
 RETURNING id, created_at
 `
 
 type InsertEventsParams struct {
-	Ids           []uuid.UUID
-	TenantIds     []uuid.UUID
-	Types         []string
-	Payloads      []string
-	Messages      []string
-	Targets       []string
-	IdemKeys      []string
-	RequestHashes [][]byte
+	Ids            []uuid.UUID
+	TenantIds      []uuid.UUID
+	Types          []string
+	Payloads       []string
+	Messages       []string
+	Targets        []string
+	IdemKeys       []string
+	RequestHashes  [][]byte
+	DeliveryCounts []int32
 }
 
 type InsertEventsRow struct {
@@ -190,9 +114,9 @@ type InsertEventsRow struct {
 	CreatedAt time.Time
 }
 
-// Many requests' events in one statement and one commit (the API's group commit). Rows whose
-// Idempotency-Key was used before are skipped; the caller handles those one by one. Empty strings stand for
-// NULL in the optional columns.
+// Many requests' events in one statement (the API's group commit; their deliveries follow in the same
+// transaction). Rows whose Idempotency-Key was used before are skipped; the caller handles those one by one.
+// Empty strings stand for NULL in the optional columns.
 func (q *Queries) InsertEvents(ctx context.Context, arg InsertEventsParams) ([]InsertEventsRow, error) {
 	rows, err := q.db.Query(ctx, insertEvents,
 		arg.Ids,
@@ -203,6 +127,7 @@ func (q *Queries) InsertEvents(ctx context.Context, arg InsertEventsParams) ([]I
 		arg.Targets,
 		arg.IdemKeys,
 		arg.RequestHashes,
+		arg.DeliveryCounts,
 	)
 	if err != nil {
 		return nil, err
@@ -223,7 +148,7 @@ func (q *Queries) InsertEvents(ctx context.Context, arg InsertEventsParams) ([]I
 }
 
 const listEvents = `-- name: ListEvents :many
-SELECT id, tenant_id, type, payload, message, targets, idempotency_key, request_hash, created_at, routed_at, delivery_count FROM events
+SELECT id, tenant_id, type, payload, message, targets, idempotency_key, request_hash, created_at, delivery_count FROM events
 WHERE tenant_id = $1
   AND ($2::text IS NULL OR type = $2::text)
   AND ($3::uuid IS NULL OR id < $3::uuid)
@@ -262,7 +187,6 @@ func (q *Queries) ListEvents(ctx context.Context, arg ListEventsParams) ([]Event
 			&i.IdempotencyKey,
 			&i.RequestHash,
 			&i.CreatedAt,
-			&i.RoutedAt,
 			&i.DeliveryCount,
 		); err != nil {
 			return nil, err
@@ -273,60 +197,6 @@ func (q *Queries) ListEvents(ctx context.Context, arg ListEventsParams) ([]Event
 		return nil, err
 	}
 	return items, nil
-}
-
-const listUnroutedEvents = `-- name: ListUnroutedEvents :many
-SELECT id, tenant_id FROM events
-WHERE routed_at IS NULL AND created_at < now() - make_interval(secs => $1::int)
-ORDER BY created_at
-LIMIT $2
-`
-
-type ListUnroutedEventsParams struct {
-	OlderThanSeconds int32
-	Lim              int32
-}
-
-type ListUnroutedEventsRow struct {
-	ID       uuid.UUID
-	TenantID uuid.UUID
-}
-
-// Events whose routing message was lost (a crash between commit and enqueue, or Redis data loss).
-func (q *Queries) ListUnroutedEvents(ctx context.Context, arg ListUnroutedEventsParams) ([]ListUnroutedEventsRow, error) {
-	rows, err := q.db.Query(ctx, listUnroutedEvents, arg.OlderThanSeconds, arg.Lim)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	items := []ListUnroutedEventsRow{}
-	for rows.Next() {
-		var i ListUnroutedEventsRow
-		if err := rows.Scan(&i.ID, &i.TenantID); err != nil {
-			return nil, err
-		}
-		items = append(items, i)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	return items, nil
-}
-
-const markEventsRouted = `-- name: MarkEventsRouted :exec
-UPDATE events e SET routed_at = now(), delivery_count = r.n
-FROM (SELECT unnest($1::uuid[]) AS id, unnest($2::int[]) AS n) AS r
-WHERE e.id = r.id
-`
-
-type MarkEventsRoutedParams struct {
-	Ids    []uuid.UUID
-	Counts []int32
-}
-
-func (q *Queries) MarkEventsRouted(ctx context.Context, arg MarkEventsRoutedParams) error {
-	_, err := q.db.Exec(ctx, markEventsRouted, arg.Ids, arg.Counts)
-	return err
 }
 
 const releaseIdempotencyKey = `-- name: ReleaseIdempotencyKey :execrows

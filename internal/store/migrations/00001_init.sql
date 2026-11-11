@@ -80,13 +80,12 @@ CREATE TABLE events (
     idempotency_key text,
     request_hash    bytea       NOT NULL,
     created_at      timestamptz NOT NULL DEFAULT now(),
-    routed_at       timestamptz,
+    -- Routing happens when the event is stored, in the same transaction as its deliveries.
     delivery_count  integer     NOT NULL DEFAULT 0
 );
 -- A key older than 24 hours is released when it is used again (the API clears it and inserts the new event).
 CREATE UNIQUE INDEX events_idempotency ON events (tenant_id, idempotency_key) WHERE idempotency_key IS NOT NULL;
 CREATE INDEX events_tenant ON events (tenant_id, id DESC);
-CREATE INDEX events_unrouted ON events (created_at) WHERE routed_at IS NULL;
 -- IDs are UUIDv7, so the primary key also orders events by time (retention deletes by ID range).
 
 -- One delivery is one event going to one endpoint (and one recipient, for email and push).

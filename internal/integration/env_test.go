@@ -171,7 +171,7 @@ func newEnv(t *testing.T, tweak func(*relayconfig.Config)) *env {
 		RetryMaxAttempts: 3, RetryBase: 100 * time.Millisecond, RetryMaxDelay: time.Second,
 		EndpointDisableAfter: 1000, EndpointDisableMinAge: time.Hour, AllowPrivateNetworks: true,
 		SecretRotationGrace: time.Hour, SweepInterval: time.Hour, SweepOverdue: 2 * time.Second,
-		SweepUnrouted: 0, Retention: 30 * 24 * time.Hour, IdempotencyTTL: 24 * time.Hour, ShutdownTimeout: 10 * time.Second,
+		Retention: 30 * 24 * time.Hour, IdempotencyTTL: 24 * time.Hour, ShutdownTimeout: 10 * time.Second,
 		EmailProvider: "log", EmailFrom: "Relay <relay@example.com>", PushReceiptAge: 0,
 		ExpoPushURL: "http://127.0.0.1:1/send", ExpoReceiptURL: "http://127.0.0.1:1/receipts",
 		Version: "test", Commit: "test",

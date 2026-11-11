@@ -86,7 +86,6 @@ type Event struct {
 	IdempotencyKey *string
 	RequestHash    []byte
 	CreatedAt      time.Time
-	RoutedAt       *time.Time
 	DeliveryCount  int32
 }
 

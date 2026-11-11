@@ -69,5 +69,5 @@ every webhook endpoint would need `rotate-secret` (and its receiver the new secr
 | `relay_requeued_total` rising | worker restarts, Redis restarts | expected after a crash; constant growth means Redis is losing data |
 | Webhook `last_error` mentions a private address | the endpoint URL | the host resolves to a private IP; Relay refuses to call it |
 
-Redis was flushed or lost: nothing to do; within `SWEEP_UNROUTED` (1 min) and `SWEEP_OVERDUE` (10 min) the
-sweeper requeues everything from PostgreSQL.
+Redis was flushed or lost: nothing to do; once deliveries are `SWEEP_OVERDUE` (10 min) late the sweeper
+requeues them from PostgreSQL.

@@ -49,7 +49,7 @@ func TestWebhookDeliveryEndToEnd(t *testing.T) {
 		r.json(t, &ev)
 		return len(ev.Deliveries) == 1 && ev.Deliveries[0].Status == "delivered"
 	})
-	if ev.DeliveryCount != 1 || ev.RoutedAt == nil {
+	if ev.DeliveryCount != 1 {
 		t.Fatalf("event: %+v", ev)
 	}
 	d := ev.Deliveries[0]

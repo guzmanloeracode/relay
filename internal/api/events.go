@@ -2,6 +2,7 @@ package api
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
@@ -14,6 +15,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/google/uuid"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
 
@@ -211,47 +213,45 @@ func (s *Server) ingest(w http.ResponseWriter, r *http.Request) {
 	}
 
 	hash := sha256.Sum256(body)
-	params := db.InsertEventParams{
+	ev := newEvent{
 		ID: ids.New(), TenantID: tenant.ID, Type: in.Type, Payload: bytes.TrimSpace(in.Payload), RequestHash: hash[:],
 	}
 	if in.Message != nil {
-		params.Message, _ = json.Marshal(in.Message)
+		ev.Message, _ = json.Marshal(in.Message)
 	}
 	if in.Targets != nil {
-		params.Targets, _ = json.Marshal(in.Targets)
+		ev.Targets, _ = json.Marshal(in.Targets)
 	}
 	if idemKey != "" {
-		params.IdempotencyKey = &idemKey
+		ev.IdempotencyKey = &idemKey
 	}
-	var row db.InsertEventRow
-	res := s.writer.write(ctx, params)
-	err = res.err
-	switch {
-	case err != nil:
-	case res.conflict:
-		err = store.ErrNotFound
-	default:
-		row = db.InsertEventRow{ID: res.id, CreatedAt: res.createdAt}
+	plan, err := s.plan(ctx, tenant.ID, in)
+	if err != nil {
+		s.log.Error("loading routes", "err", err)
+		internal(w)
+		return
 	}
-	for retried := false; store.IsNotFound(err); retried = true { // the Idempotency-Key was used before
-		prev, err2 := s.store.GetEventByIdempotencyKey(ctx, db.GetEventByIdempotencyKeyParams{TenantID: tenant.ID, IdempotencyKey: &idemKey})
-		if store.IsNotFound(err2) && !retried { // released meanwhile
-			row, err = s.store.InsertEvent(ctx, params)
+
+	res := s.writer.write(ctx, ev, plan)
+	for retried := false; res.err == nil && res.conflict; retried = true { // the Idempotency-Key was used before
+		prev, err := s.store.GetEventByIdempotencyKey(ctx, db.GetEventByIdempotencyKeyParams{TenantID: tenant.ID, IdempotencyKey: &idemKey})
+		if store.IsNotFound(err) && !retried { // released meanwhile
+			res = s.writer.write(ctx, ev, plan)
 			continue
 		}
-		if err2 != nil {
-			s.log.Error("loading idempotent event", "err", err2)
+		if err != nil {
+			s.log.Error("loading idempotent event", "err", err)
 			internal(w)
 			return
 		}
 		if time.Since(prev.CreatedAt) > s.cfg.IdempotencyTTL && !retried {
 			// The key's window is over: free it and store this request as a new event.
-			if _, err2 := s.store.ReleaseIdempotencyKey(ctx, db.ReleaseIdempotencyKeyParams{TenantID: tenant.ID, ID: prev.ID, Key: idemKey}); err2 != nil {
-				s.log.Error("releasing idempotency key", "err", err2)
+			if _, err := s.store.ReleaseIdempotencyKey(ctx, db.ReleaseIdempotencyKeyParams{TenantID: tenant.ID, ID: prev.ID, Key: idemKey}); err != nil {
+				s.log.Error("releasing idempotency key", "err", err)
 				internal(w)
 				return
 			}
-			row, err = s.store.InsertEvent(ctx, params)
+			res = s.writer.write(ctx, ev, plan)
 			continue
 		}
 		if !bytes.Equal(prev.RequestHash, hash[:]) {
@@ -265,20 +265,48 @@ func (s *Server) ingest(w http.ResponseWriter, r *http.Request) {
 		s.accepted(w, tenant.Slug, in.Type, prev.ID, prev.CreatedAt)
 		return
 	}
-	if err != nil {
-		s.log.Error("storing event", "err", err)
+	if res.err != nil {
+		s.log.Error("storing event", "err", res.err)
 		internal(w)
 		return
 	}
-	if err := s.q.EnqueueEvents(ctx, queue.EventRef{Event: row.ID, Tenant: tenant.ID}); err != nil {
-		// Stored but not queued: the worker's sweeper routes it within a minute.
-		s.log.Warn("queueing event failed; the sweeper will route it", "err", err)
-	}
 	result = "accepted"
-	s.accepted(w, tenant.Slug, in.Type, row.ID, row.CreatedAt)
+	s.accepted(w, tenant.Slug, in.Type, res.id, res.createdAt)
 }
 
-func (s *Server) accepted(w http.ResponseWriter, tenant, typ string, id [16]byte, created time.Time) {
+// newEvent is an event on its way to the database.
+type newEvent struct {
+	ID, TenantID              uuid.UUID
+	Type                      string
+	Payload, Message, Targets []byte
+	IdempotencyKey            *string
+	RequestHash               []byte
+}
+
+// plan routes an event: which endpoints (and recipients) get it, from the tenant's subscriptions.
+func (s *Server) plan(ctx context.Context, tenant uuid.UUID, in EventIn) ([]router.Planned, error) {
+	routes, err := s.routes.GetOrLoad(tenant, func() ([]router.Route, error) {
+		rows, err := s.store.ListRoutes(ctx, tenant)
+		if err != nil {
+			return nil, err
+		}
+		return router.FromRows(rows), nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	var targets router.Targets
+	if in.Targets != nil {
+		targets = *in.Targets
+	}
+	plan, skips := router.Plan(in.Type, in.Message != nil, targets, targets.EndpointSet(), routes)
+	for _, sk := range skips {
+		s.m.RoutingSkipped.WithLabelValues(sk.Channel, sk.Reason).Inc()
+	}
+	return plan, nil
+}
+
+func (s *Server) accepted(w http.ResponseWriter, tenant, typ string, id uuid.UUID, created time.Time) {
 	eid := ids.Encode(ids.Event, id)
 	w.Header().Set("Location", "/v1/tenants/"+tenant+"/events/"+eid)
 	writeJSON(w, http.StatusAccepted, Accepted{ID: eid, Tenant: tenant, Type: typ, Status: "accepted", CreatedAt: created})

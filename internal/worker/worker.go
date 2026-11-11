@@ -1,9 +1,9 @@
-// Package worker routes events into deliveries, attempts deliveries under the tenants' limits, retries them,
-// and keeps the queues honest (sweeper, lease expiry, parking lots, push receipts, retention).
+// Package worker attempts deliveries under the tenants' limits, retries them, and keeps the queues honest
+// (sweeper, parking lots, push receipts, retention). Routing happens in the API, when an event is stored.
 //
-// Any number of worker processes can run against the same PostgreSQL and Redis: Redis consumer groups split the
-// streams between them, a delivery is attempted only by the process that claims it in PostgreSQL, and the
-// limits live in Redis.
+// Any number of worker processes can run against the same PostgreSQL and Redis: a Redis consumer group splits
+// the stream between them, a delivery is attempted only by the process holding its slot, and the limits live in
+// Redis.
 package worker
 
 import (
@@ -27,7 +27,6 @@ import (
 	"github.com/guzmanloeracode/relay/internal/crypto"
 	"github.com/guzmanloeracode/relay/internal/observability"
 	"github.com/guzmanloeracode/relay/internal/queue"
-	"github.com/guzmanloeracode/relay/internal/router"
 	"github.com/guzmanloeracode/relay/internal/store"
 )
 
@@ -43,7 +42,6 @@ type Worker struct {
 	expo     *push.Expo
 	consumer string
 
-	routes *cache.Cache[uuid.UUID, []router.Route]
 	limits *cache.Cache[[2]uuid.UUID, queue.Limits]
 	// Webhook endpoints whose failure streak is known to be zero (saves a write per delivered webhook).
 	healthy *cache.Cache[uuid.UUID, bool]
@@ -74,7 +72,6 @@ func New(cfg config.Config, st *store.Store, q *queue.Queue, log *slog.Logger, m
 	w := &Worker{
 		cfg: cfg, store: st, q: q, log: log, m: m, box: box,
 		consumer: fmt.Sprintf("%s-%d", host, os.Getpid()),
-		routes:   cache.New[uuid.UUID, []router.Route](30*time.Second, 50_000),
 		limits:   cache.New[[2]uuid.UUID, queue.Limits](15*time.Second, 100_000),
 		healthy:  cache.New[uuid.UUID, bool](time.Minute, 100_000),
 	}
@@ -136,9 +133,6 @@ func (w *Worker) Run(ctx context.Context) error {
 		})
 	}
 	go w.listenInvalidations(ctx)
-	for range routers {
-		start("router", w.routeLoop) // several, so one slow batch doesn't hold routing up
-	}
 	start("deliver", func(ctx context.Context) { w.deliverLoop(ctx, workCtx) })
 	start("promote", w.promoteLoop)
 	start("sweep", w.sweepLoop)
@@ -170,10 +164,7 @@ func (w *Worker) listenInvalidations(ctx context.Context) {
 			continue
 		}
 		switch kind {
-		case "routes":
-			w.routes.Delete(uid)
 		case "tenant":
-			w.routes.Delete(uid)
 			w.limits.DeleteFunc(func(k [2]uuid.UUID, _ queue.Limits) bool { return k[0] == uid })
 		case "endpoint":
 			w.limits.DeleteFunc(func(k [2]uuid.UUID, _ queue.Limits) bool { return k[1] == uid })

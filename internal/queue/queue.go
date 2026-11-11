@@ -1,6 +1,6 @@
-// Package queue holds Relay's Redis side: two streams with consumer groups (events to route, deliveries to
-// attempt), a sorted set of delayed retries, per-tenant token buckets, and per-endpoint and per-tenant
-// concurrency slots with parking lots.
+// Package queue holds Relay's Redis side: a stream with a consumer group (deliveries due now), a sorted set of
+// delayed retries, per-tenant token buckets, and per-endpoint and per-tenant concurrency slots with parking
+// lots.
 //
 // PostgreSQL stays the source of truth. Redis only carries IDs of work that is due, so anything lost here
 // (a crash, a flushed Redis) is found again by the worker's sweeper. See docs/adr/001-redis-streams.md.
@@ -20,9 +20,7 @@ import (
 
 // Redis keys. Everything lives under "relay:" so the instance can share a Redis server.
 const (
-	EventsStream     = "relay:events"
 	DeliveriesStream = "relay:deliveries"
-	RouterGroup      = "routers"
 	WorkerGroup      = "workers"
 	delayedKey       = "relay:delayed"
 	parkedIndexKey   = "relay:parked"
@@ -53,22 +51,6 @@ func ParseItem(s string) (Item, error) {
 		}
 	}
 	return it, nil
-}
-
-// EventRef identifies an event waiting to be routed.
-type EventRef struct{ Event, Tenant uuid.UUID }
-
-func (e EventRef) String() string { return e.Event.String() + " " + e.Tenant.String() }
-
-// ParseEventRef reads EventRef.String.
-func ParseEventRef(s string) (EventRef, error) {
-	a, b, ok := strings.Cut(s, " ")
-	ev, err1 := uuid.Parse(a)
-	te, err2 := uuid.Parse(b)
-	if !ok || err1 != nil || err2 != nil {
-		return EventRef{}, fmt.Errorf("queue: bad event ref %q", s)
-	}
-	return EventRef{Event: ev, Tenant: te}, nil
 }
 
 func semKey(kind string, id uuid.UUID) string  { return "relay:sem:" + kind + ":" + id.String() }
@@ -105,29 +87,13 @@ func New(rdb redis.UniversalClient) *Queue { return &Queue{rdb: rdb} }
 // Client exposes the Redis client (health checks).
 func (q *Queue) Client() redis.UniversalClient { return q.rdb }
 
-// Setup creates both consumer groups (and the streams) if they don't exist.
+// Setup creates the consumer group (and the stream) if it doesn't exist.
 func (q *Queue) Setup(ctx context.Context) error {
-	for stream, group := range map[string]string{EventsStream: RouterGroup, DeliveriesStream: WorkerGroup} {
-		err := q.rdb.XGroupCreateMkStream(ctx, stream, group, "0").Err()
-		if err != nil && !strings.Contains(err.Error(), "BUSYGROUP") {
-			return fmt.Errorf("queue: create group %s: %w", group, err)
-		}
+	err := q.rdb.XGroupCreateMkStream(ctx, DeliveriesStream, WorkerGroup, "0").Err()
+	if err != nil && !strings.Contains(err.Error(), "BUSYGROUP") {
+		return fmt.Errorf("queue: create group: %w", err)
 	}
 	return nil
-}
-
-// EnqueueEvents adds events to the routing stream.
-func (q *Queue) EnqueueEvents(ctx context.Context, refs ...EventRef) error {
-	if len(refs) == 0 {
-		return nil
-	}
-	_, err := q.rdb.Pipelined(ctx, func(p redis.Pipeliner) error {
-		for _, r := range refs {
-			p.XAdd(ctx, &redis.XAddArgs{Stream: EventsStream, Values: []any{itemField, r.String()}})
-		}
-		return nil
-	})
-	return err
 }
 
 // EnqueueDeliveries adds deliveries that are due now to the delivery stream.
@@ -363,16 +329,13 @@ func (q *Queue) Reclaim(ctx context.Context, stream, group, consumer string, min
 
 // Depth reports the work waiting in Redis, for the metrics.
 type Depth struct {
-	Events, Deliveries, Delayed, Parked int64
+	Deliveries, Delayed, Parked int64
 }
 
 // Depths reads the current backlog sizes.
 func (q *Queue) Depths(ctx context.Context) (Depth, error) {
 	var d Depth
 	var err error
-	if d.Events, err = q.rdb.XLen(ctx, EventsStream).Result(); err != nil {
-		return d, err
-	}
 	if d.Deliveries, err = q.rdb.XLen(ctx, DeliveriesStream).Result(); err != nil {
 		return d, err
 	}

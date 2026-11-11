@@ -108,7 +108,6 @@ type EventView struct {
 	Targets        json.RawMessage `json:"targets"`
 	IdempotencyKey *string         `json:"idempotency_key"`
 	CreatedAt      time.Time       `json:"created_at"`
-	RoutedAt       *time.Time      `json:"routed_at"`
 	DeliveryCount  int32           `json:"delivery_count"`
 	Deliveries     []DeliveryView  `json:"deliveries,omitempty"`
 }
@@ -124,7 +123,7 @@ func eventView(e db.Event, tenant string) EventView {
 	return EventView{
 		ID: ids.Encode(ids.Event, e.ID), Tenant: tenant, Type: e.Type, Payload: e.Payload,
 		Message: rawOrNull(e.Message), Targets: rawOrNull(e.Targets), IdempotencyKey: e.IdempotencyKey,
-		CreatedAt: e.CreatedAt, RoutedAt: e.RoutedAt, DeliveryCount: e.DeliveryCount,
+		CreatedAt: e.CreatedAt, DeliveryCount: e.DeliveryCount,
 	}
 }
 

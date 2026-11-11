@@ -38,7 +38,6 @@ type Config struct {
 
 	SweepInterval   time.Duration
 	SweepOverdue    time.Duration // a due delivery this late is queued again
-	SweepUnrouted   time.Duration // an event not routed after this long is queued again
 	Retention       time.Duration
 	IdempotencyTTL  time.Duration
 	ShutdownTimeout time.Duration
@@ -84,7 +83,6 @@ func Load() (Config, error) {
 
 		SweepInterval:   e.dur("SWEEP_INTERVAL", 30*time.Second),
 		SweepOverdue:    e.dur("SWEEP_OVERDUE", 10*time.Minute),
-		SweepUnrouted:   e.dur("SWEEP_UNROUTED", time.Minute),
 		Retention:       e.dur("RETENTION", 30*24*time.Hour),
 		IdempotencyTTL:  e.dur("IDEMPOTENCY_TTL", 24*time.Hour),
 		ShutdownTimeout: e.dur("SHUTDOWN_TIMEOUT", 30*time.Second),

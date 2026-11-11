@@ -1,5 +1,5 @@
 // Package router decides which deliveries an event becomes, from the tenant's subscriptions and the event's
-// targets. It is pure: the worker loads the routes and stores the plan.
+// targets. It is pure: the API loads the routes and stores the plan with the event.
 package router
 
 import (
@@ -8,6 +8,8 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/guzmanloeracode/relay/internal/channels"
+	"github.com/guzmanloeracode/relay/internal/ids"
+	"github.com/guzmanloeracode/relay/internal/store/db"
 )
 
 // Limits on the fan-out of one event.
@@ -30,6 +32,29 @@ type Targets struct {
 	Users     []string `json:"users,omitempty"`     // push: the users whose devices get it
 	Emails    []string `json:"emails,omitempty"`    // email: recipients (instead of the endpoint's default list)
 	Endpoints []string `json:"endpoints,omitempty"` // only these endpoints (public IDs), among the subscribed ones
+}
+
+// FromRows turns the tenant's subscriptions (as ListRoutes returns them) into one route per endpoint.
+func FromRows(rows []db.ListRoutesRow) []Route {
+	routes := make([]Route, len(rows))
+	for i, r := range rows {
+		routes[i] = Route{EndpointID: r.EndpointID, Channel: r.Channel, EmailTo: r.EmailTo, Patterns: r.EventTypes}
+	}
+	return Merge(routes)
+}
+
+// EndpointSet decodes targets.endpoints; nil when the event names none.
+func (t Targets) EndpointSet() map[uuid.UUID]bool {
+	if len(t.Endpoints) == 0 {
+		return nil
+	}
+	set := make(map[uuid.UUID]bool, len(t.Endpoints))
+	for _, s := range t.Endpoints {
+		if id, err := ids.Decode(ids.Endpoint, s); err == nil {
+			set[id] = true
+		}
+	}
+	return set
 }
 
 // Planned is one delivery to create.

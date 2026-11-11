@@ -62,8 +62,9 @@ func TestTenantConcurrencyAcrossEndpoints(t *testing.T) {
 	e.startWorker()
 
 	var peak int32
-	done := make(chan struct{})
+	done, stopped := make(chan struct{}), make(chan struct{})
 	go func() {
+		defer close(stopped)
 		for {
 			select {
 			case <-done:
@@ -81,6 +82,7 @@ func TestTenantConcurrencyAcrossEndpoints(t *testing.T) {
 	}
 	eventually(t, 10*time.Second, "18 deliveries", func() bool { return a.count()+b.count()+shared.count() == 18 })
 	close(done)
+	<-stopped
 	if peak > 3 {
 		t.Fatalf("tenant had %d concurrent attempts, limit is 3", peak)
 	}
@@ -128,7 +130,8 @@ func TestRecoveryAfterRedisDataLoss(t *testing.T) {
 	if rcv.count() != 0 {
 		t.Fatal("events were delivered without the sweeper")
 	}
-	w.Sweep(context.Background()) // unrouted events go back to the stream
+	time.Sleep(2 * time.Second)   // SWEEP_OVERDUE in the tests
+	w.Sweep(context.Background()) // overdue deliveries go back to the stream
 	eventually(t, 5*time.Second, "the 5 events after the sweep", func() bool { return rcv.count() == 5 })
 
 	// A due delivery whose queue entry was lost (pending in PostgreSQL, nowhere in Redis) is found once overdue.
@@ -152,7 +155,7 @@ func TestDeadConsumerEntriesAreTakenOver(t *testing.T) {
 	e.endpoint(key, "acme", map[string]any{"channel": "webhook", "url": rcv.url(), "event_types": []string{"*"}})
 	e.send(key, map[string]any{"type": "job.done", "payload": map[string]any{}})
 	ctx := context.Background()
-	msgs, err := e.q.Read(ctx, queue.EventsStream, queue.RouterGroup, "worker-that-died", 10, 0)
+	msgs, err := e.q.Read(ctx, queue.DeliveriesStream, queue.WorkerGroup, "worker-that-died", 10, 0)
 	if err != nil || len(msgs) != 1 {
 		t.Fatalf("dead consumer read %d: %v", len(msgs), err)
 	}
@@ -163,7 +166,7 @@ func TestDeadConsumerEntriesAreTakenOver(t *testing.T) {
 	}
 	time.Sleep(2 * time.Second)
 	e.newWorker().Sweep(ctx)
-	eventually(t, 5*time.Second, "the taken-over event", func() bool { return rcv.count() == 1 })
+	eventually(t, 5*time.Second, "the taken-over delivery", func() bool { return rcv.count() == 1 })
 }
 
 func TestGracefulShutdownDrainsAttempts(t *testing.T) {

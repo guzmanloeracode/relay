@@ -21,6 +21,7 @@ import (
 	"github.com/guzmanloeracode/relay/internal/crypto"
 	"github.com/guzmanloeracode/relay/internal/observability"
 	"github.com/guzmanloeracode/relay/internal/queue"
+	"github.com/guzmanloeracode/relay/internal/router"
 	"github.com/guzmanloeracode/relay/internal/store"
 	"github.com/guzmanloeracode/relay/internal/store/db"
 )
@@ -38,6 +39,7 @@ type Server struct {
 	tenants *cache.Cache[string, db.Tenant] // by slug
 	touched *cache.Cache[uuid.UUID, bool]   // keys whose last_used_at was written recently
 	writer  *eventWriter
+	routes  *cache.Cache[uuid.UUID, []router.Route] // by tenant
 }
 
 type cachedKey struct {
@@ -52,13 +54,15 @@ func New(cfg config.Config, st *store.Store, q *queue.Queue, log *slog.Logger, m
 	if err != nil {
 		return nil, err
 	}
-	return &Server{
+	s := &Server{
 		cfg: cfg, store: st, q: q, log: log, m: m, box: box,
 		keys:    cache.New[string, cachedKey](30*time.Second, 100_000),
 		tenants: cache.New[string, db.Tenant](30*time.Second, 100_000),
 		touched: cache.New[uuid.UUID, bool](5*time.Minute, 100_000),
-		writer:  newEventWriter(st, writerFlushers, writerBatch),
-	}, nil
+		routes:  cache.New[uuid.UUID, []router.Route](30*time.Second, 100_000),
+	}
+	s.writer = newEventWriter(s, writerFlushers, writerBatch)
+	return s, nil
 }
 
 // Flushers write batches in parallel, each on its own connection; a batch holds up to writerBatch events.
@@ -77,20 +81,30 @@ func (s *Server) Start(ctx context.Context) {
 // ListenInvalidations drops cache entries that other processes changed, until ctx ends.
 func (s *Server) ListenInvalidations(ctx context.Context) {
 	for msg := range s.q.Invalidations(ctx) {
-		kind, v, _ := strings.Cut(msg, ":")
-		switch kind {
-		case "key":
-			s.keys.Delete(v)
-		case "tenant":
-			id, err := uuid.Parse(v)
-			if err != nil {
-				continue
-			}
-			s.tenants.DeleteFunc(func(_ string, t db.Tenant) bool { return t.ID == id })
-			s.keys.DeleteFunc(func(_ string, k cachedKey) bool {
-				return k.principal.TenantID != nil && *k.principal.TenantID == id
-			})
-		}
+		s.dropCached(msg)
+	}
+}
+
+// dropCached drops what an invalidation names: "key:<hash>", "tenant:<id>" or "routes:<tenant id>".
+func (s *Server) dropCached(msg string) {
+	kind, v, _ := strings.Cut(msg, ":")
+	if kind == "key" {
+		s.keys.Delete(v)
+		return
+	}
+	id, err := uuid.Parse(v)
+	if err != nil {
+		return
+	}
+	switch kind {
+	case "routes":
+		s.routes.Delete(id)
+	case "tenant":
+		s.routes.Delete(id)
+		s.tenants.DeleteFunc(func(_ string, t db.Tenant) bool { return t.ID == id })
+		s.keys.DeleteFunc(func(_ string, k cachedKey) bool {
+			return k.principal.TenantID != nil && *k.principal.TenantID == id
+		})
 	}
 }
 
@@ -343,8 +357,9 @@ func (s *Server) tenantBySlug(ctx context.Context, slug string) (db.Tenant, erro
 	return s.tenants.GetOrLoad(slug, func() (db.Tenant, error) { return s.store.GetTenantBySlug(ctx, slug) })
 }
 
-// invalidate drops a cache entry here and in every other process.
+// invalidate drops a cache entry here at once and in every other process through Redis.
 func (s *Server) invalidate(ctx context.Context, what string) {
+	s.dropCached(what)
 	if err := s.q.Invalidate(ctx, what); err != nil {
 		s.log.Warn("publishing cache invalidation", "err", err, "what", what)
 	}
