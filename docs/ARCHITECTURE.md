@@ -7,13 +7,13 @@ Relay is one Go binary with two roles, `relay api` and `relay worker`, around Po
 flowchart LR
     C[Client application<br/>e.g. FieldOps worker] -- POST /v1/events --> API
     subgraph Relay
-        API[relay api<br/>auth · validation · idempotency · token bucket]
-        W[relay worker × N<br/>router · deliverer · sweeper]
+        API[relay api<br/>auth · validation · idempotency ·<br/>token bucket · routing · group commit]
+        W[relay worker × N<br/>slots · attempts · retries · sweeper]
     end
-    API -- insert event --> PG[(PostgreSQL<br/>tenants, keys, endpoints,<br/>events, deliveries, attempts)]
-    API -- XADD event id --> R[(Redis<br/>streams · delayed set ·<br/>slots · buckets)]
+    API -- event + its deliveries,<br/>one transaction --> PG[(PostgreSQL<br/>tenants, keys, endpoints,<br/>events, deliveries, attempts)]
+    API -- XADD delivery ids --> R[(Redis<br/>stream · delayed set ·<br/>slots · buckets)]
     R -- XREADGROUP --> W
-    W -- claim, record --> PG
+    W -- load, record in batches --> PG
     W -- signed POST --> X[Webhook endpoints]
     W -- Resend / SMTP --> E[Email]
     W -- Expo Push API --> P[Devices]
@@ -33,20 +33,24 @@ sequenceDiagram
     participant X as Receiver
     App->>API: POST /v1/events (Idempotency-Key)
     API->>R: token bucket (tenant ingest rate)
-    API->>PG: INSERT event (unique tenant + key)
-    API->>R: XADD relay:events
+    API->>API: route: the tenant's subscriptions (cached) → deliveries
+    API->>PG: one transaction for every request waiting: INSERT events, INSERT their deliveries
+    API->>R: XADD relay:deliveries
     API-->>App: 202 Accepted {id}
-    W->>R: XREADGROUP relay:events (batch of up to 200)
-    W->>PG: one transaction: INSERT deliveries, mark events routed
-    W->>R: XADD relay:deliveries, XACK + XDEL
-    W->>R: XREADGROUP relay:deliveries
-    W->>R: acquire endpoint slot + tenant slot + delivery token, with a lease (Lua)
-    W->>PG: load the delivery if it is still pending and due
+    W->>R: XREADGROUP relay:deliveries (as many as it has free slots)
+    W->>R: endpoint slot + tenant slot + delivery token per delivery, with a lease (pipelined Lua)
+    W->>PG: load the deliveries still pending and due (one query)
     W->>X: POST, signed (10 s timeout)
     X-->>W: 2xx / error
-    W->>PG: one statement: record the attempt and the next status
-    W->>R: release slots (wakes a parked delivery), or ZADD relay:delayed for a retry
+    W->>PG: record attempts and next states (batched)
+    W->>R: release slots (wakes a parked delivery) or ZADD relay:delayed for a retry; XACK + XDEL
 ```
+
+**Group commit.** The API stores events through a few flushers: each takes every request waiting at that
+moment and writes their events and deliveries with one statement each, in one transaction. One commit (one WAL
+flush) then covers many requests, and the API answers `202` only after it. With little traffic a batch holds a
+single event; under load batches grow on their own, so ingestion latency stays flat as the rate rises. The worker
+records attempt results the same way.
 
 ## Delivery states
 
@@ -65,8 +69,8 @@ stateDiagram-v2
 | Package | Does |
 |---|---|
 | `cmd/relay` | Subcommands: `api`, `worker`, `all`, `migrate`, `keys create`, `healthcheck`, `sink`, `version` |
-| `internal/api` | chi router, authentication and scopes, RFC 9457 errors, cursor pagination, every handler |
-| `internal/worker` | The router loop, the delivery loop (bounded by `WORKER_CONCURRENCY`), retries and backoff, endpoint disabling, the sweeper, parking-lot recovery, push receipts, retention |
+| `internal/api` | chi router, authentication and scopes, RFC 9457 errors, cursor pagination, routing at ingestion, the group-commit event writer, every handler |
+| `internal/worker` | The delivery loop (bounded by `WORKER_CONCURRENCY`), batched loading and recording, retries and backoff, endpoint disabling, the sweeper, parking-lot recovery, push receipts, retention |
 | `internal/router` | Pure fan-out logic: which subscriptions match an event and which deliveries it becomes |
 | `internal/queue` | Redis Streams, the delayed set, token buckets and concurrency slots (Lua scripts in `scripts/`) |
 | `internal/channels/*` | Webhook (signing, SSRF guard, timeouts), email (Resend, SMTP, log) and push (Expo) senders |
@@ -83,8 +87,8 @@ another worker takes the entry over once the lease has passed (`XAUTOCLAIM`).
 
 - **At least once.** A delivery is recorded only after the receiver answers. A crash in between sends it
   again, with the same `webhook-id`. Receivers deduplicate on it.
-- **No lost events.** An event is committed to PostgreSQL before `202`. If Redis loses its data, the sweeper
-  finds unrouted events and overdue deliveries in PostgreSQL ([ADR 001](adr/001-redis-streams.md)).
+- **No lost events.** An event and its deliveries are committed to PostgreSQL before `202`. If Redis loses its
+  data, the sweeper finds the overdue deliveries in PostgreSQL ([ADR 001](adr/001-redis-streams.md)).
 - **Ordering is not guaranteed.** Deliveries to one endpoint run concurrently (up to its `max_in_flight`) and
   retries reorder them. Set `max_in_flight` to 1 for best-effort order; use the event's `created_at` to order
   for certain.
