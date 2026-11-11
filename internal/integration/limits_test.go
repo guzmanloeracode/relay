@@ -133,6 +133,9 @@ func TestRecoveryAfterRedisDataLoss(t *testing.T) {
 	time.Sleep(2 * time.Second)   // SWEEP_OVERDUE in the tests
 	w.Sweep(context.Background()) // overdue deliveries go back to the stream
 	eventually(t, 5*time.Second, "the 5 events after the sweep", func() bool { return rcv.count() == 5 })
+	eventually(t, 5*time.Second, "the 5 attempts to be recorded", func() bool {
+		return countStatus(e.deliveries(key, "acme", ""), "delivered") == 5
+	})
 
 	// A due delivery whose queue entry was lost (pending in PostgreSQL, nowhere in Redis) is found once overdue.
 	if _, err := e.st.Pool.Exec(context.Background(),
