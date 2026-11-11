@@ -176,6 +176,9 @@ func (s *Server) Handler() http.Handler {
 		problem(w, http.StatusMethodNotAllowed, "method_not_allowed", "This route does not accept that method.")
 	})
 
+	if s.cfg.OTLPEndpoint == "" {
+		return r // no tracing: skip the instrumentation's per-request work
+	}
 	return otelhttp.NewHandler(r, "relay.api", otelhttp.WithSpanNameFormatter(func(_ string, r *http.Request) string {
 		return r.Method + " " + routePattern(r)
 	}))
