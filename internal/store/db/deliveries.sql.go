@@ -114,7 +114,6 @@ INSERT INTO deliveries (id, tenant_id, event_id, endpoint_id, channel, recipient
 SELECT unnest($1::uuid[]), unnest($2::uuid[]), unnest($3::uuid[]),
        unnest($4::uuid[]), unnest($5::text[]), unnest($6::text[]),
        $7::int
-ON CONFLICT (event_id, endpoint_id, recipient, replay_of) DO NOTHING
 RETURNING id, tenant_id, endpoint_id
 `
 
@@ -134,7 +133,7 @@ type InsertDeliveriesRow struct {
 	EndpointID uuid.UUID
 }
 
-// Routing is idempotent: an event routed twice (after a crash) keeps one delivery per endpoint and recipient.
+// An event's deliveries, in the event's own transaction.
 func (q *Queries) InsertDeliveries(ctx context.Context, arg InsertDeliveriesParams) ([]InsertDeliveriesRow, error) {
 	rows, err := q.db.Query(ctx, insertDeliveries,
 		arg.Ids,

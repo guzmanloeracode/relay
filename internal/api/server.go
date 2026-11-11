@@ -67,8 +67,9 @@ func New(cfg config.Config, st *store.Store, q *queue.Queue, log *slog.Logger, m
 
 // Flushers write batches in parallel, each on its own connection; a batch holds up to writerBatch events.
 const (
-	writerFlushers = 8
-	writerBatch    = 128
+	writerFlushers = 4
+	writerBatch    = 256
+	writerLinger   = time.Millisecond
 )
 
 // Start runs the background parts of the API (the event writer and the cache invalidation listener) until ctx

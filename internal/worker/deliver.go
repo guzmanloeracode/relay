@@ -18,7 +18,11 @@ import (
 	"github.com/guzmanloeracode/relay/internal/store/db"
 )
 
-const maxReadBatch = 100
+const (
+	maxReadBatch = 100
+	smallRead    = 16
+	readLinger   = 5 * time.Millisecond
+)
 
 // deliverLoop reads the delivery stream only as fast as it has free attempt slots, so a slow receiver
 // never makes this process pull more work than it can hold.
@@ -55,6 +59,9 @@ func (w *Worker) deliverLoop(ctx, workCtx context.Context) {
 				defer w.inflight.Done()
 				w.dispatch(workCtx, msgs, slots)
 			}()
+		}
+		if len(msgs) > 0 && len(msgs) < smallRead {
+			pause(ctx, readLinger) // steady traffic: let the next read gather a bigger batch
 		}
 	}
 }

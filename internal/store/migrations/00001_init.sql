@@ -112,9 +112,9 @@ CREATE TABLE deliveries (
     created_at       timestamptz NOT NULL DEFAULT now(),
     completed_at     timestamptz
 );
--- Routing is idempotent on (event, endpoint, recipient); a replay differs by replay_of. The index also serves
--- "deliveries of an event" and the cascade when events are deleted.
-CREATE UNIQUE INDEX deliveries_route ON deliveries (event_id, endpoint_id, recipient, replay_of) NULLS NOT DISTINCT;
+-- Deliveries are created once, in the event's own transaction, so nothing needs a uniqueness check here. This
+-- index serves "deliveries of an event" and the cascade when events are deleted.
+CREATE INDEX deliveries_event ON deliveries (event_id);
 CREATE INDEX deliveries_tenant ON deliveries (tenant_id, id DESC);
 CREATE INDEX deliveries_endpoint ON deliveries (endpoint_id, id DESC);
 CREATE INDEX deliveries_dead ON deliveries (tenant_id, id DESC) WHERE status = 'dead' AND replayed_at IS NULL;

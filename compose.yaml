@@ -89,6 +89,10 @@ services:
   api:
     <<: *relay
     command: ["api"]
+    environment:
+      <<: *relay-env
+      GOGC: "200"          # fewer collections; the memory limit below keeps the heap in check
+      GOMEMLIMIT: 96MiB
     ports:
       - "127.0.0.1:${RELAY_PORT:-8080}:8080"
     depends_on:
@@ -105,6 +109,10 @@ services:
   worker:
     <<: *relay
     command: ["worker"]
+    environment:
+      <<: *relay-env
+      GOGC: "200"
+      GOMEMLIMIT: 144MiB
     depends_on:
       migrate: { condition: service_completed_successfully }
       redis: { condition: service_healthy }

@@ -7,6 +7,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/guzmanloeracode/relay/internal/batch"
 	"github.com/guzmanloeracode/relay/internal/ids"
 	"github.com/guzmanloeracode/relay/internal/observability"
 	"github.com/guzmanloeracode/relay/internal/queue"
@@ -19,7 +20,8 @@ import (
 // it) to one of a few flushers; a flusher takes every event waiting at that moment and stores them and their
 // deliveries in one transaction, so one commit (and one WAL flush) covers many requests, then queues the
 // deliveries. It never waits on purpose: with little traffic each batch holds one event, and under load batches
-// grow by themselves, which keeps ingestion latency flat as the rate rises.
+// grow by themselves, which keeps ingestion latency flat as the rate rises. A flusher that found only a few events
+// waits up to writerLinger for more, so steady traffic is written in fewer, larger statements.
 type eventWriter struct {
 	st          *store.Store
 	q           *queue.Queue
@@ -28,6 +30,7 @@ type eventWriter struct {
 	maxAttempts int32
 	in          chan *pendingEvent
 	max         int
+	linger      time.Duration
 }
 
 type pendingEvent struct {
@@ -45,31 +48,23 @@ type writeResult struct {
 
 func newEventWriter(s *Server, flushers, maxBatch int) *eventWriter {
 	return &eventWriter{st: s.store, q: s.q, log: s.log, m: s.m, maxAttempts: int32(s.cfg.RetryMaxAttempts),
-		in: make(chan *pendingEvent, flushers*maxBatch), max: maxBatch}
+		in: make(chan *pendingEvent, flushers*maxBatch), max: maxBatch, linger: writerLinger}
 }
 
 // run starts the flushers; they stop when ctx ends.
 func (w *eventWriter) run(ctx context.Context, flushers int) {
 	for range flushers {
 		go func() {
-			batch := make([]*pendingEvent, 0, w.max)
+			b := make([]*pendingEvent, 0, w.max)
 			for {
 				select {
 				case <-ctx.Done():
 					return
 				case first := <-w.in:
-					batch = append(batch[:0], first)
+					b = append(b[:0], first)
 				}
-			fill:
-				for len(batch) < w.max {
-					select {
-					case p := <-w.in:
-						batch = append(batch, p)
-					default:
-						break fill
-					}
-				}
-				w.flush(context.WithoutCancel(ctx), batch)
+				b = batch.Collect(w.in, b, w.max, w.linger)
+				w.flush(context.WithoutCancel(ctx), b)
 			}
 		}()
 	}

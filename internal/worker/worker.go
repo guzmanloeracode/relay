@@ -53,8 +53,9 @@ type Worker struct {
 
 // The recorder's flushers write attempt results in parallel batches of up to recorderBatch.
 const (
-	recorderFlushers = 4
-	recorderBatch    = 128
+	recorderFlushers = 2
+	recorderBatch    = 256
+	recorderLinger   = 3 * time.Millisecond
 )
 
 // Options lets tests replace the channel senders.

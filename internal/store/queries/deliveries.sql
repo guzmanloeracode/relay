@@ -1,10 +1,9 @@
 -- name: InsertDeliveries :many
--- Routing is idempotent: an event routed twice (after a crash) keeps one delivery per endpoint and recipient.
+-- An event's deliveries, in the event's own transaction.
 INSERT INTO deliveries (id, tenant_id, event_id, endpoint_id, channel, recipient, max_attempts)
 SELECT unnest(sqlc.arg('ids')::uuid[]), unnest(sqlc.arg('tenant_ids')::uuid[]), unnest(sqlc.arg('event_ids')::uuid[]),
        unnest(sqlc.arg('endpoint_ids')::uuid[]), unnest(sqlc.arg('channels')::text[]), unnest(sqlc.arg('recipients')::text[]),
        sqlc.arg('max_attempts')::int
-ON CONFLICT (event_id, endpoint_id, recipient, replay_of) DO NOTHING
 RETURNING id, tenant_id, endpoint_id;
 
 -- name: DeadLetterIfEndpointDisabled :execrows

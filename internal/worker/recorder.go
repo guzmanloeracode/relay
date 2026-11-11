@@ -7,6 +7,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/guzmanloeracode/relay/internal/batch"
 	"github.com/guzmanloeracode/relay/internal/store"
 	"github.com/guzmanloeracode/relay/internal/store/db"
 )
@@ -14,10 +15,11 @@ import (
 // recorder writes attempt results in batches, like the API's event writer: every result waiting when a flusher
 // is free goes into one statement, so a busy worker spends one round trip and one commit on many attempts.
 type recorder struct {
-	st  *store.Store
-	log *slog.Logger
-	in  chan *pendingRecord
-	max int
+	st     *store.Store
+	log    *slog.Logger
+	in     chan *pendingRecord
+	max    int
+	linger time.Duration
 }
 
 type pendingRecord struct {
@@ -40,30 +42,22 @@ type recordResult struct {
 }
 
 func newRecorder(st *store.Store, log *slog.Logger, flushers, maxBatch int) *recorder {
-	return &recorder{st: st, log: log, in: make(chan *pendingRecord, flushers*maxBatch), max: maxBatch}
+	return &recorder{st: st, log: log, in: make(chan *pendingRecord, flushers*maxBatch), max: maxBatch, linger: recorderLinger}
 }
 
 func (r *recorder) run(ctx context.Context, flushers int) {
 	for range flushers {
 		go func() {
-			batch := make([]*pendingRecord, 0, r.max)
+			b := make([]*pendingRecord, 0, r.max)
 			for {
 				select {
 				case <-ctx.Done():
 					return
 				case first := <-r.in:
-					batch = append(batch[:0], first)
+					b = append(b[:0], first)
 				}
-			fill:
-				for len(batch) < r.max {
-					select {
-					case p := <-r.in:
-						batch = append(batch, p)
-					default:
-						break fill
-					}
-				}
-				r.flush(ctx, batch)
+				b = batch.Collect(r.in, b, r.max, r.linger)
+				r.flush(ctx, b)
 			}
 		}()
 	}
