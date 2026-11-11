@@ -20,8 +20,8 @@ import (
 
 const (
 	maxReadBatch = 100
-	smallRead    = 16
-	readLinger   = 5 * time.Millisecond
+	smallRead    = 32
+	readLinger   = 10 * time.Millisecond
 )
 
 // deliverLoop reads the delivery stream only as fast as it has free attempt slots, so a slow receiver

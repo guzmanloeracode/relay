@@ -55,7 +55,7 @@ type Worker struct {
 const (
 	recorderFlushers = 2
 	recorderBatch    = 256
-	recorderLinger   = 3 * time.Millisecond
+	recorderLinger   = 5 * time.Millisecond
 )
 
 // Options lets tests replace the channel senders.
