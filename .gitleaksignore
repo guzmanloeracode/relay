@@ -1,0 +1,5 @@
+# False positives, both in the first commit:
+# - the Standard Webhooks specification's published test vector (a public example secret)
+# - an example Idempotency-Key in the landing page's curl sample
+60602b44742088325251a7d2b624543203380d37:pkg/webhook/webhook_test.go:generic-api-key:14
+60602b44742088325251a7d2b624543203380d37:internal/api/web/landing.html:generic-api-key:52

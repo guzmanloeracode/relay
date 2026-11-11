@@ -11,7 +11,7 @@ import (
 
 // The test vector published with the Standard Webhooks specification.
 const (
-	specSecret = "whsec_MfKQ9r8GKYqrTwjUPD8ILPZIo2LaLaSw"
+	specSecret = "whsec_MfKQ9r8GKYqrTwjUPD8ILPZIo2LaLaSw" // gitleaks:allow (the specification's public test vector)
 	specID     = "msg_p5jXN8AQM9LWM0D4loKWxJek"
 	specTS     = 1614265330
 	specBody   = `{"test": 2432232314}`
