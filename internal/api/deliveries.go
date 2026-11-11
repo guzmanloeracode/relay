@@ -11,7 +11,7 @@ import (
 	"github.com/guzmanloeracode/relay/internal/store/db"
 )
 
-var deliveryStatuses = map[string]bool{"pending": true, "delivering": true, "delivered": true, "skipped": true, "dead": true}
+var deliveryStatuses = map[string]bool{"pending": true, "delivered": true, "skipped": true, "dead": true}
 
 func (s *Server) listDeliveries(w http.ResponseWriter, r *http.Request) {
 	pg, ok := parsePage(w, r, ids.Delivery)
@@ -40,7 +40,7 @@ func (s *Server) listDeliveries(w http.ResponseWriter, r *http.Request) {
 		if deliveryStatuses[v] {
 			params.Status = &v
 		} else {
-			errs = append(errs, FieldError{Path: "status", Message: "must be pending, delivering, delivered, skipped or dead"})
+			errs = append(errs, FieldError{Path: "status", Message: "must be pending, delivered, skipped or dead"})
 		}
 	}
 	if len(errs) > 0 {

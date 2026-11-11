@@ -34,7 +34,6 @@ type Delivery struct {
 	Attempts       int32
 	MaxAttempts    int32
 	NextAttemptAt  time.Time
-	LeaseUntil     *time.Time
 	LastStatusCode *int32
 	LastError      *string
 	LastLatencyMs  *int32

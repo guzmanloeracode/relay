@@ -15,16 +15,17 @@ import (
 
 const deleteEventsBefore = `-- name: DeleteEventsBefore :execrows
 DELETE FROM events e WHERE e.id IN (
-    SELECT o.id FROM events o WHERE o.created_at < $1::timestamptz LIMIT $2::int
+    SELECT o.id FROM events o WHERE o.id < $1::uuid ORDER BY o.id LIMIT $2::int
 )
 `
 
 type DeleteEventsBeforeParams struct {
-	Before time.Time
+	Before uuid.UUID
 	Lim    int32
 }
 
-// Deliveries and attempts go with their event (ON DELETE CASCADE).
+// Deliveries and attempts go with their event (ON DELETE CASCADE). before is a UUIDv7 made from the cutoff
+// time, so this walks the primary key.
 func (q *Queries) DeleteEventsBefore(ctx context.Context, arg DeleteEventsBeforeParams) (int64, error) {
 	result, err := q.db.Exec(ctx, deleteEventsBefore, arg.Before, arg.Lim)
 	if err != nil {
@@ -266,22 +267,20 @@ func (q *Queries) MarkEventsRouted(ctx context.Context, arg MarkEventsRoutedPara
 	return err
 }
 
-const releaseIdempotencyKeys = `-- name: ReleaseIdempotencyKeys :execrows
-UPDATE events e SET idempotency_key = NULL
-WHERE e.id IN (
-    SELECT o.id FROM events o
-    WHERE o.created_at < $1::timestamptz AND o.idempotency_key IS NOT NULL
-    LIMIT $2::int
-)
+const releaseIdempotencyKey = `-- name: ReleaseIdempotencyKey :execrows
+UPDATE events SET idempotency_key = NULL
+WHERE tenant_id = $1 AND id = $2 AND idempotency_key = $3::text
 `
 
-type ReleaseIdempotencyKeysParams struct {
-	Before time.Time
-	Lim    int32
+type ReleaseIdempotencyKeyParams struct {
+	TenantID uuid.UUID
+	ID       uuid.UUID
+	Key      string
 }
 
-func (q *Queries) ReleaseIdempotencyKeys(ctx context.Context, arg ReleaseIdempotencyKeysParams) (int64, error) {
-	result, err := q.db.Exec(ctx, releaseIdempotencyKeys, arg.Before, arg.Lim)
+// Frees an expired key so a new event can use it.
+func (q *Queries) ReleaseIdempotencyKey(ctx context.Context, arg ReleaseIdempotencyKeyParams) (int64, error) {
+	result, err := q.db.Exec(ctx, releaseIdempotencyKey, arg.TenantID, arg.ID, arg.Key)
 	if err != nil {
 		return 0, err
 	}

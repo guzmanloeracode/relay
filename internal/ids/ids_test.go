@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"sort"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 )
@@ -57,5 +58,20 @@ func TestDecodeRejects(t *testing.T) {
 	upper := "ep_" + string(bytes.ToUpper([]byte(good[3:])))
 	if _, err := Decode(Endpoint, upper); err != nil {
 		t.Errorf("upper-case body should decode: %v", err)
+	}
+}
+
+func TestFromTime(t *testing.T) {
+	now := time.Now()
+	cut := FromTime(now)
+	before := New()
+	time.Sleep(2 * time.Millisecond)
+	after := New()
+	later := FromTime(now.Add(time.Second))
+	if bytes.Compare(before[:], later[:]) >= 0 || bytes.Compare(after[:], cut[:]) <= 0 {
+		t.Fatal("FromTime does not order with New")
+	}
+	if cut.Version() != 7 {
+		t.Fatalf("version %d", cut.Version())
 	}
 }

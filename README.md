@@ -124,7 +124,7 @@ Other languages can use the official [Standard Webhooks libraries](https://githu
 | **API key** | `rk_…`, bound to one tenant or valid for all. Scopes: `ingest`, `read`, `manage`, `admin` (tenants and keys). |
 | **Endpoint** | A destination on one channel: a webhook URL (with its secret), an email route (default recipients) or a push route. |
 | **Subscription** | Event-type patterns (`job.completed`, `job.*`, `*`) that send events to an endpoint. |
-| **Delivery** | One event to one endpoint (and one recipient for email and push): `pending` → `delivering` → `delivered`, `skipped` or `dead`. |
+| **Delivery** | One event to one endpoint (and one recipient for email and push): `pending` until an attempt settles it: `delivered`, `skipped` or `dead`. |
 | **Attempt** | One try of a delivery, logged with its status code, latency, error and response. |
 
 | Attempt | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 |

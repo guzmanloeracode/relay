@@ -13,82 +13,6 @@ import (
 	"github.com/google/uuid"
 )
 
-const claimDelivery = `-- name: ClaimDelivery :one
-WITH claimed AS (
-    UPDATE deliveries d SET
-        status      = 'delivering',
-        attempts    = d.attempts + 1,
-        lease_until = now() + make_interval(secs => $1::int)
-    WHERE d.id = $2
-      AND d.status = 'pending'
-      AND d.next_attempt_at <= now() + interval '2 seconds'
-      AND EXISTS (SELECT 1 FROM endpoints e WHERE e.id = d.endpoint_id AND e.status = 'active')
-    RETURNING d.id, d.tenant_id, d.event_id, d.endpoint_id, d.channel, d.recipient, d.attempts, d.max_attempts
-)
-SELECT c.id, c.tenant_id, c.event_id, c.endpoint_id, c.channel, c.recipient, c.attempts, c.max_attempts,
-       ev.type AS event_type, ev.payload, ev.message, ev.created_at AS event_created_at,
-       en.url, en.secret_enc, en.previous_secret_enc, en.previous_secret_expires_at, en.email_to,
-       t.slug AS tenant_slug
-FROM claimed c
-JOIN events ev ON ev.id = c.event_id
-JOIN endpoints en ON en.id = c.endpoint_id
-JOIN tenants t ON t.id = c.tenant_id
-`
-
-type ClaimDeliveryParams struct {
-	LeaseSeconds int32
-	ID           uuid.UUID
-}
-
-type ClaimDeliveryRow struct {
-	ID                      uuid.UUID
-	TenantID                uuid.UUID
-	EventID                 uuid.UUID
-	EndpointID              uuid.UUID
-	Channel                 string
-	Recipient               string
-	Attempts                int32
-	MaxAttempts             int32
-	EventType               string
-	Payload                 json.RawMessage
-	Message                 json.RawMessage
-	EventCreatedAt          time.Time
-	Url                     *string
-	SecretEnc               []byte
-	PreviousSecretEnc       []byte
-	PreviousSecretExpiresAt *time.Time
-	EmailTo                 []string
-	TenantSlug              string
-}
-
-// Takes a due delivery for one attempt. A message for a delivery that is already done, leased by another
-// worker or not due yet (a stale duplicate) matches nothing, which makes queue redelivery harmless.
-func (q *Queries) ClaimDelivery(ctx context.Context, arg ClaimDeliveryParams) (ClaimDeliveryRow, error) {
-	row := q.db.QueryRow(ctx, claimDelivery, arg.LeaseSeconds, arg.ID)
-	var i ClaimDeliveryRow
-	err := row.Scan(
-		&i.ID,
-		&i.TenantID,
-		&i.EventID,
-		&i.EndpointID,
-		&i.Channel,
-		&i.Recipient,
-		&i.Attempts,
-		&i.MaxAttempts,
-		&i.EventType,
-		&i.Payload,
-		&i.Message,
-		&i.EventCreatedAt,
-		&i.Url,
-		&i.SecretEnc,
-		&i.PreviousSecretEnc,
-		&i.PreviousSecretExpiresAt,
-		&i.EmailTo,
-		&i.TenantSlug,
-	)
-	return i, err
-}
-
 const countDeliveriesByStatus = `-- name: CountDeliveriesByStatus :many
 SELECT status, count(*)::bigint AS n FROM deliveries GROUP BY status
 `
@@ -150,46 +74,8 @@ func (q *Queries) DeadLetterIfEndpointDisabled(ctx context.Context, id uuid.UUID
 	return result.RowsAffected(), nil
 }
 
-const expireLeases = `-- name: ExpireLeases :many
-UPDATE deliveries d SET status = 'pending', lease_until = NULL, next_attempt_at = now()
-WHERE d.id IN (
-    SELECT id FROM deliveries
-    WHERE status = 'delivering' AND lease_until < now()
-    LIMIT $1
-    FOR UPDATE SKIP LOCKED
-)
-RETURNING d.id, d.tenant_id, d.endpoint_id
-`
-
-type ExpireLeasesRow struct {
-	ID         uuid.UUID
-	TenantID   uuid.UUID
-	EndpointID uuid.UUID
-}
-
-// A worker died during an attempt: the attempt counts (it may have been sent) and the delivery is due again.
-func (q *Queries) ExpireLeases(ctx context.Context, lim int32) ([]ExpireLeasesRow, error) {
-	rows, err := q.db.Query(ctx, expireLeases, lim)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	items := []ExpireLeasesRow{}
-	for rows.Next() {
-		var i ExpireLeasesRow
-		if err := rows.Scan(&i.ID, &i.TenantID, &i.EndpointID); err != nil {
-			return nil, err
-		}
-		items = append(items, i)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	return items, nil
-}
-
 const getDelivery = `-- name: GetDelivery :one
-SELECT id, tenant_id, event_id, endpoint_id, channel, recipient, status, attempts, max_attempts, next_attempt_at, lease_until, last_status_code, last_error, last_latency_ms, dead_reason, replay_of, replayed_at, created_at, completed_at FROM deliveries WHERE tenant_id = $1 AND id = $2
+SELECT id, tenant_id, event_id, endpoint_id, channel, recipient, status, attempts, max_attempts, next_attempt_at, last_status_code, last_error, last_latency_ms, dead_reason, replay_of, replayed_at, created_at, completed_at FROM deliveries WHERE tenant_id = $1 AND id = $2
 `
 
 type GetDeliveryParams struct {
@@ -211,7 +97,6 @@ func (q *Queries) GetDelivery(ctx context.Context, arg GetDeliveryParams) (Deliv
 		&i.Attempts,
 		&i.MaxAttempts,
 		&i.NextAttemptAt,
-		&i.LeaseUntil,
 		&i.LastStatusCode,
 		&i.LastError,
 		&i.LastLatencyMs,
@@ -229,7 +114,7 @@ INSERT INTO deliveries (id, tenant_id, event_id, endpoint_id, channel, recipient
 SELECT unnest($1::uuid[]), unnest($2::uuid[]), unnest($3::uuid[]),
        unnest($4::uuid[]), unnest($5::text[]), unnest($6::text[]),
        $7::int
-ON CONFLICT (event_id, endpoint_id, recipient) WHERE replay_of IS NULL DO NOTHING
+ON CONFLICT (event_id, endpoint_id, recipient, replay_of) DO NOTHING
 RETURNING id, tenant_id, endpoint_id
 `
 
@@ -313,7 +198,7 @@ func (q *Queries) ListAttempts(ctx context.Context, deliveryID uuid.UUID) ([]Del
 }
 
 const listDeadLetters = `-- name: ListDeadLetters :many
-SELECT id, tenant_id, event_id, endpoint_id, channel, recipient, status, attempts, max_attempts, next_attempt_at, lease_until, last_status_code, last_error, last_latency_ms, dead_reason, replay_of, replayed_at, created_at, completed_at FROM deliveries
+SELECT id, tenant_id, event_id, endpoint_id, channel, recipient, status, attempts, max_attempts, next_attempt_at, last_status_code, last_error, last_latency_ms, dead_reason, replay_of, replayed_at, created_at, completed_at FROM deliveries
 WHERE tenant_id = $1 AND status = 'dead' AND replayed_at IS NULL
   AND ($2::uuid IS NULL OR endpoint_id = $2::uuid)
   AND ($3::uuid IS NULL OR id < $3::uuid)
@@ -353,7 +238,6 @@ func (q *Queries) ListDeadLetters(ctx context.Context, arg ListDeadLettersParams
 			&i.Attempts,
 			&i.MaxAttempts,
 			&i.NextAttemptAt,
-			&i.LeaseUntil,
 			&i.LastStatusCode,
 			&i.LastError,
 			&i.LastLatencyMs,
@@ -374,7 +258,7 @@ func (q *Queries) ListDeadLetters(ctx context.Context, arg ListDeadLettersParams
 }
 
 const listDeliveries = `-- name: ListDeliveries :many
-SELECT id, tenant_id, event_id, endpoint_id, channel, recipient, status, attempts, max_attempts, next_attempt_at, lease_until, last_status_code, last_error, last_latency_ms, dead_reason, replay_of, replayed_at, created_at, completed_at FROM deliveries
+SELECT id, tenant_id, event_id, endpoint_id, channel, recipient, status, attempts, max_attempts, next_attempt_at, last_status_code, last_error, last_latency_ms, dead_reason, replay_of, replayed_at, created_at, completed_at FROM deliveries
 WHERE tenant_id = $1
   AND ($2::uuid IS NULL OR event_id = $2::uuid)
   AND ($3::uuid IS NULL OR endpoint_id = $3::uuid)
@@ -420,7 +304,6 @@ func (q *Queries) ListDeliveries(ctx context.Context, arg ListDeliveriesParams) 
 			&i.Attempts,
 			&i.MaxAttempts,
 			&i.NextAttemptAt,
-			&i.LeaseUntil,
 			&i.LastStatusCode,
 			&i.LastError,
 			&i.LastLatencyMs,
@@ -441,7 +324,7 @@ func (q *Queries) ListDeliveries(ctx context.Context, arg ListDeliveriesParams) 
 }
 
 const listEventDeliveries = `-- name: ListEventDeliveries :many
-SELECT id, tenant_id, event_id, endpoint_id, channel, recipient, status, attempts, max_attempts, next_attempt_at, lease_until, last_status_code, last_error, last_latency_ms, dead_reason, replay_of, replayed_at, created_at, completed_at FROM deliveries WHERE tenant_id = $1 AND event_id = $2 ORDER BY id
+SELECT id, tenant_id, event_id, endpoint_id, channel, recipient, status, attempts, max_attempts, next_attempt_at, last_status_code, last_error, last_latency_ms, dead_reason, replay_of, replayed_at, created_at, completed_at FROM deliveries WHERE tenant_id = $1 AND event_id = $2 ORDER BY id
 `
 
 type ListEventDeliveriesParams struct {
@@ -469,7 +352,6 @@ func (q *Queries) ListEventDeliveries(ctx context.Context, arg ListEventDeliveri
 			&i.Attempts,
 			&i.MaxAttempts,
 			&i.NextAttemptAt,
-			&i.LeaseUntil,
 			&i.LastStatusCode,
 			&i.LastError,
 			&i.LastLatencyMs,
@@ -489,18 +371,83 @@ func (q *Queries) ListEventDeliveries(ctx context.Context, arg ListEventDeliveri
 	return items, nil
 }
 
+const loadDelivery = `-- name: LoadDelivery :one
+SELECT d.id, d.tenant_id, d.event_id, d.endpoint_id, d.channel, d.recipient, d.attempts, d.max_attempts,
+       ev.type AS event_type, ev.payload, ev.message, ev.created_at AS event_created_at,
+       en.url, en.secret_enc, en.previous_secret_enc, en.previous_secret_expires_at, en.email_to,
+       t.slug AS tenant_slug
+FROM deliveries d
+JOIN events ev ON ev.id = d.event_id
+JOIN endpoints en ON en.id = d.endpoint_id
+JOIN tenants t ON t.id = d.tenant_id
+WHERE d.id = $1
+  AND d.status = 'pending'
+  AND d.next_attempt_at <= now() + interval '2 seconds'
+  AND en.status = 'active'
+`
+
+type LoadDeliveryRow struct {
+	ID                      uuid.UUID
+	TenantID                uuid.UUID
+	EventID                 uuid.UUID
+	EndpointID              uuid.UUID
+	Channel                 string
+	Recipient               string
+	Attempts                int32
+	MaxAttempts             int32
+	EventType               string
+	Payload                 json.RawMessage
+	Message                 json.RawMessage
+	EventCreatedAt          time.Time
+	Url                     *string
+	SecretEnc               []byte
+	PreviousSecretEnc       []byte
+	PreviousSecretExpiresAt *time.Time
+	EmailTo                 []string
+	TenantSlug              string
+}
+
+// Reads a due delivery for an attempt. A message for a delivery that is done or not due yet (a stale
+// duplicate) matches nothing, which makes queue redelivery harmless. The worker holds the delivery's slot in
+// Redis while it attempts; the result is written once, by RecordAttempt.
+func (q *Queries) LoadDelivery(ctx context.Context, id uuid.UUID) (LoadDeliveryRow, error) {
+	row := q.db.QueryRow(ctx, loadDelivery, id)
+	var i LoadDeliveryRow
+	err := row.Scan(
+		&i.ID,
+		&i.TenantID,
+		&i.EventID,
+		&i.EndpointID,
+		&i.Channel,
+		&i.Recipient,
+		&i.Attempts,
+		&i.MaxAttempts,
+		&i.EventType,
+		&i.Payload,
+		&i.Message,
+		&i.EventCreatedAt,
+		&i.Url,
+		&i.SecretEnc,
+		&i.PreviousSecretEnc,
+		&i.PreviousSecretExpiresAt,
+		&i.EmailTo,
+		&i.TenantSlug,
+	)
+	return i, err
+}
+
 const recordAttempt = `-- name: RecordAttempt :execrows
 WITH upd AS (
     UPDATE deliveries d SET
         status           = CASE $6::text WHEN 'retry' THEN 'pending' ELSE $6::text END,
-        lease_until      = NULL,
+        attempts         = d.attempts + 1,
         next_attempt_at  = $7::timestamptz,
         last_status_code = $3::int,
         last_error       = $4::text,
         last_latency_ms  = $2::int,
         dead_reason      = $8::text,
         completed_at     = CASE $6::text WHEN 'retry' THEN NULL ELSE now() END
-    WHERE d.id = $9 AND d.status = 'delivering'
+    WHERE d.id = $9 AND d.status = 'pending' AND d.attempts = $10::int
     RETURNING d.id, d.attempts
 )
 INSERT INTO delivery_attempts (delivery_id, attempt, started_at, latency_ms, status_code, error, response_body, outcome)
@@ -519,9 +466,12 @@ type RecordAttemptParams struct {
 	NextAttemptAt time.Time
 	DeadReason    *string
 	ID            uuid.UUID
+	SeenAttempts  int32
 }
 
-// Closes the attempt and logs it in one statement. outcome 'retry' puts the delivery back to pending.
+// Records one attempt and the delivery's next state in one statement. It only applies if nobody recorded an
+// attempt since the delivery was loaded (attempts unchanged), so a duplicate attempt never counts twice.
+// outcome 'retry' keeps the delivery pending until next_attempt_at.
 func (q *Queries) RecordAttempt(ctx context.Context, arg RecordAttemptParams) (int64, error) {
 	result, err := q.db.Exec(ctx, recordAttempt,
 		arg.StartedAt,
@@ -533,6 +483,7 @@ func (q *Queries) RecordAttempt(ctx context.Context, arg RecordAttemptParams) (i
 		arg.NextAttemptAt,
 		arg.DeadReason,
 		arg.ID,
+		arg.SeenAttempts,
 	)
 	if err != nil {
 		return 0, err
@@ -609,7 +560,7 @@ INSERT INTO deliveries (id, tenant_id, event_id, endpoint_id, channel, recipient
 SELECT $1::uuid, orig.tenant_id, orig.event_id, orig.endpoint_id, orig.channel, orig.recipient,
        $2::int, orig.id
 FROM orig
-RETURNING id, tenant_id, event_id, endpoint_id, channel, recipient, status, attempts, max_attempts, next_attempt_at, lease_until, last_status_code, last_error, last_latency_ms, dead_reason, replay_of, replayed_at, created_at, completed_at
+RETURNING id, tenant_id, event_id, endpoint_id, channel, recipient, status, attempts, max_attempts, next_attempt_at, last_status_code, last_error, last_latency_ms, dead_reason, replay_of, replayed_at, created_at, completed_at
 `
 
 type ReplayDeliveryParams struct {
@@ -639,7 +590,6 @@ func (q *Queries) ReplayDelivery(ctx context.Context, arg ReplayDeliveryParams) 
 		&i.Attempts,
 		&i.MaxAttempts,
 		&i.NextAttemptAt,
-		&i.LeaseUntil,
 		&i.LastStatusCode,
 		&i.LastError,
 		&i.LastLatencyMs,

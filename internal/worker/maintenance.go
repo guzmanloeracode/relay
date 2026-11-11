@@ -4,6 +4,8 @@ import (
 	"context"
 	"time"
 
+	"github.com/guzmanloeracode/relay/internal/ids"
+
 	"github.com/guzmanloeracode/relay/internal/queue"
 	"github.com/guzmanloeracode/relay/internal/store/db"
 )
@@ -31,17 +33,9 @@ func (w *Worker) sweepLoop(ctx context.Context) {
 	every(ctx, w.cfg.SweepInterval, func() { w.Sweep(ctx) })
 }
 
-// Sweep requeues work whose queue entry was lost: expired leases (a worker died mid-attempt), deliveries long
-// overdue, events never routed, and stream entries a dead consumer never acknowledged.
+// Sweep requeues work whose queue entry was lost: deliveries long overdue, events never routed, and stream
+// entries a dead consumer (a worker that died mid-attempt) never acknowledged.
 func (w *Worker) Sweep(ctx context.Context) {
-	if rows, err := w.store.ExpireLeases(ctx, 500); err == nil && len(rows) > 0 {
-		items := make([]queue.Item, len(rows))
-		for i, r := range rows {
-			items[i] = queue.Item{Delivery: r.ID, Tenant: r.TenantID, Endpoint: r.EndpointID}
-		}
-		w.m.Requeued.WithLabelValues("expired_lease").Add(float64(len(items)))
-		_ = w.q.EnqueueDeliveries(ctx, items...)
-	}
 	if rows, err := w.store.RequeueOverdue(ctx, db.RequeueOverdueParams{
 		OlderThanSeconds: int32(w.cfg.SweepOverdue.Seconds()), Lim: 1000,
 	}); err == nil && len(rows) > 0 {
@@ -60,7 +54,7 @@ func (w *Worker) Sweep(ctx context.Context) {
 		w.m.Requeued.WithLabelValues("unrouted").Add(float64(len(refs)))
 		_ = w.q.EnqueueEvents(ctx, refs...)
 	}
-	minIdle := 2 * w.cfg.LeaseDuration
+	minIdle := w.cfg.LeaseDuration // past its lease, nobody can still be attempting the entry
 	if msgs, err := w.q.Reclaim(ctx, queue.EventsStream, queue.RouterGroup, w.consumer, minIdle, routeBatch); err == nil && len(msgs) > 0 {
 		w.m.Requeued.WithLabelValues("reclaimed").Add(float64(len(msgs)))
 		if err := w.route(ctx, msgs); err != nil {
@@ -149,7 +143,7 @@ func (w *Worker) CheckReceipts(ctx context.Context) {
 	}
 }
 
-// cleanupLoop releases idempotency keys after their window and deletes events past the retention period.
+// cleanupLoop deletes events (with their deliveries and attempts) past the retention period.
 func (w *Worker) cleanupLoop(ctx context.Context) {
 	every(ctx, 10*time.Minute, func() { w.Cleanup(ctx) })
 }
@@ -157,13 +151,7 @@ func (w *Worker) cleanupLoop(ctx context.Context) {
 // Cleanup runs one retention pass in small batches.
 func (w *Worker) Cleanup(ctx context.Context) {
 	for ctx.Err() == nil {
-		n, err := w.store.ReleaseIdempotencyKeys(ctx, db.ReleaseIdempotencyKeysParams{Before: time.Now().Add(-w.cfg.IdempotencyTTL), Lim: 5000})
-		if err != nil || n < 5000 {
-			break
-		}
-	}
-	for ctx.Err() == nil {
-		n, err := w.store.DeleteEventsBefore(ctx, db.DeleteEventsBeforeParams{Before: time.Now().Add(-w.cfg.Retention), Lim: 1000})
+		n, err := w.store.DeleteEventsBefore(ctx, db.DeleteEventsBeforeParams{Before: ids.FromTime(time.Now().Add(-w.cfg.Retention)), Lim: 1000})
 		if err != nil || n < 1000 {
 			break
 		}

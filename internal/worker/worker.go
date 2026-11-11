@@ -45,6 +45,8 @@ type Worker struct {
 
 	routes *cache.Cache[uuid.UUID, []router.Route]
 	limits *cache.Cache[[2]uuid.UUID, queue.Limits]
+	// Webhook endpoints whose failure streak is known to be zero (saves a write per delivered webhook).
+	healthy *cache.Cache[uuid.UUID, bool]
 
 	inflight sync.WaitGroup
 }
@@ -66,6 +68,7 @@ func New(cfg config.Config, st *store.Store, q *queue.Queue, log *slog.Logger, m
 		consumer: fmt.Sprintf("%s-%d", host, os.Getpid()),
 		routes:   cache.New[uuid.UUID, []router.Route](30*time.Second, 50_000),
 		limits:   cache.New[[2]uuid.UUID, queue.Limits](15*time.Second, 100_000),
+		healthy:  cache.New[uuid.UUID, bool](time.Minute, 100_000),
 	}
 	w.expo = &push.Expo{
 		SendURL: cfg.ExpoPushURL, ReceiptsURL: cfg.ExpoReceiptURL, AccessToken: cfg.ExpoToken,
@@ -162,6 +165,7 @@ func (w *Worker) listenInvalidations(ctx context.Context) {
 			w.limits.DeleteFunc(func(k [2]uuid.UUID, _ queue.Limits) bool { return k[0] == uid })
 		case "endpoint":
 			w.limits.DeleteFunc(func(k [2]uuid.UUID, _ queue.Limits) bool { return k[1] == uid })
+			w.healthy.Delete(uid)
 		}
 	}
 }

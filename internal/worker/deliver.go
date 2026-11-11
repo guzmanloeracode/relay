@@ -100,9 +100,9 @@ func (w *Worker) handle(ctx context.Context, m queue.Message) {
 		}
 	}()
 
-	row, err := w.store.ClaimDelivery(ctx, db.ClaimDeliveryParams{ID: it.Delivery, LeaseSeconds: int32(w.cfg.LeaseDuration.Seconds())})
+	row, err := w.store.LoadDelivery(ctx, it.Delivery)
 	if store.IsNotFound(err) {
-		// Done already, leased elsewhere, not due yet, or its endpoint was disabled meanwhile.
+		// Done already, not due yet (a stale duplicate), or its endpoint was disabled meanwhile.
 		if n, err := w.store.DeadLetterIfEndpointDisabled(ctx, it.Delivery); err == nil && n > 0 {
 			w.m.DeadLettered.WithLabelValues("endpoint_disabled").Inc()
 		}
@@ -110,7 +110,7 @@ func (w *Worker) handle(ctx context.Context, m queue.Message) {
 		return
 	}
 	if err != nil {
-		w.log.Error("claiming delivery", "err", err)
+		w.log.Error("loading delivery", "err", err)
 		return
 	}
 	w.attempt(ctx, it, row)
@@ -133,7 +133,7 @@ func (w *Worker) limitsFor(ctx context.Context, it queue.Item) (queue.Limits, er
 }
 
 // attempt sends a claimed delivery and records the outcome.
-func (w *Worker) attempt(ctx context.Context, it queue.Item, row db.ClaimDeliveryRow) {
+func (w *Worker) attempt(ctx context.Context, it queue.Item, row db.LoadDeliveryRow) {
 	ctx, span := observability.Tracer.Start(ctx, "relay.deliver")
 	defer span.End()
 	span.SetAttributes(
@@ -149,7 +149,8 @@ func (w *Worker) attempt(ctx context.Context, it queue.Item, row db.ClaimDeliver
 	started := time.Now()
 	if res == nil {
 		sender := w.senders[row.Channel]
-		attemptCtx, cancel := context.WithTimeout(ctx, w.cfg.LeaseDuration-5*time.Second)
+		// The attempt must end before the slot's lease does, or another worker could start a second one.
+		attemptCtx, cancel := context.WithTimeout(ctx, w.cfg.LeaseDuration*9/10)
 		r := sender.Send(attemptCtx, job)
 		cancel()
 		res = &r
@@ -163,13 +164,13 @@ func (w *Worker) attempt(ctx context.Context, it queue.Item, row db.ClaimDeliver
 }
 
 // job builds the channel's input. A non-nil result means the delivery can't be attempted at all.
-func (w *Worker) job(row db.ClaimDeliveryRow) (*channels.Job, *channels.Result) {
+func (w *Worker) job(row db.LoadDeliveryRow) (*channels.Job, *channels.Result) {
 	j := &channels.Job{
 		DeliveryID: row.ID, EventID: row.EventID, TenantID: row.TenantID, EndpointID: row.EndpointID,
 		TenantSlug: row.TenantSlug, EventType: row.EventType, EventCreatedAt: row.EventCreatedAt,
-		Payload: row.Payload, Attempt: int(row.Attempts), Recipient: row.Recipient,
+		Payload: row.Payload, Attempt: int(row.Attempts) + 1, Recipient: row.Recipient,
 	}
-	if row.Attempts > row.MaxAttempts { // a lease expired on the last attempt
+	if row.Attempts >= row.MaxAttempts {
 		return j, &channels.Result{Outcome: channels.Dead, Reason: "max_attempts", Error: "no attempts left"}
 	}
 	if len(row.Message) > 0 && string(row.Message) != "null" {
@@ -197,15 +198,16 @@ func (w *Worker) job(row db.ClaimDeliveryRow) (*channels.Job, *channels.Result) 
 }
 
 // record stores the attempt and decides what happens next: done, retry later, or the dead-letter queue.
-func (w *Worker) record(ctx context.Context, it queue.Item, row db.ClaimDeliveryRow, res channels.Result, started time.Time, latency time.Duration) {
+func (w *Worker) record(ctx context.Context, it queue.Item, row db.LoadDeliveryRow, res channels.Result, started time.Time, latency time.Duration) {
 	outcome := res.Outcome
 	reason := res.Reason
 	next := time.Now()
+	attempt := int(row.Attempts) + 1
 	if outcome == channels.Retry {
-		if int(row.Attempts) >= int(row.MaxAttempts) {
+		if attempt >= int(row.MaxAttempts) {
 			outcome, reason = channels.Dead, "max_attempts"
 		} else {
-			wait := Backoff(int(row.Attempts), w.cfg.RetryBase, w.cfg.RetryMaxDelay)
+			wait := Backoff(attempt, w.cfg.RetryBase, w.cfg.RetryMaxDelay)
 			if res.RetryAfter > wait {
 				wait = min(res.RetryAfter, w.cfg.RetryMaxDelay)
 			}
@@ -213,25 +215,32 @@ func (w *Worker) record(ctx context.Context, it queue.Item, row db.ClaimDelivery
 		}
 	}
 	p := db.RecordAttemptParams{
-		ID: row.ID, Outcome: outcome.String(), NextAttemptAt: next, StartedAt: started,
+		ID: row.ID, SeenAttempts: row.Attempts, Outcome: outcome.String(), NextAttemptAt: next, StartedAt: started,
 		LatencyMs: int32(latency.Milliseconds()), StatusCode: nonZero(res.StatusCode),
 		Error: nonEmpty(res.Error), ResponseBody: nonEmpty(res.ResponseBody),
 	}
 	if outcome == channels.Dead || outcome == channels.Skipped {
 		p.DeadReason = nonEmpty(reason)
 	}
-	if _, err := w.store.RecordAttempt(ctx, p); err != nil {
-		// The lease expires and the sweeper makes the delivery due again: at least once, never lost.
+	n, err := w.store.RecordAttempt(ctx, p)
+	if err != nil {
+		// Not recorded: the delivery is still pending and its message unacknowledged, so it is attempted
+		// again (at least once, never lost).
 		w.log.Error("recording attempt", "err", err, "delivery_id", ids.Encode(ids.Delivery, row.ID))
 		return
+	}
+	if n == 0 {
+		return // another worker recorded this attempt first (a duplicate after a slot's lease expired)
 	}
 	w.m.Attempts.WithLabelValues(row.Channel, outcome.String()).Inc()
 
 	switch outcome {
 	case channels.Delivered:
 		w.m.DeliveryLag.WithLabelValues(row.Channel).Observe(time.Since(row.EventCreatedAt).Seconds())
-		if row.Channel == channels.Webhook {
-			_ = w.store.RecordEndpointSuccess(ctx, row.EndpointID)
+		if _, healthy := w.healthy.Get(row.EndpointID); !healthy && row.Channel == channels.Webhook {
+			if w.store.RecordEndpointSuccess(ctx, row.EndpointID) == nil {
+				w.healthy.Set(row.EndpointID, true) // skip the write while the endpoint keeps succeeding
+			}
 		}
 	case channels.Retry:
 		if err := w.q.Schedule(ctx, it, next); err != nil {
@@ -248,7 +257,8 @@ func (w *Worker) record(ctx context.Context, it queue.Item, row db.ClaimDelivery
 }
 
 // countFailure extends the endpoint's failure streak and disables it once the streak is long enough.
-func (w *Worker) countFailure(ctx context.Context, row db.ClaimDeliveryRow) {
+func (w *Worker) countFailure(ctx context.Context, row db.LoadDeliveryRow) {
+	w.healthy.Delete(row.EndpointID)
 	f, err := w.store.RecordEndpointFailure(ctx, row.EndpointID)
 	if err != nil || f.Status != "active" || f.FailingSince == nil {
 		return
@@ -258,7 +268,7 @@ func (w *Worker) countFailure(ctx context.Context, row db.ClaimDeliveryRow) {
 	}
 }
 
-func (w *Worker) disableEndpoint(ctx context.Context, row db.ClaimDeliveryRow, why, metric string) {
+func (w *Worker) disableEndpoint(ctx context.Context, row db.LoadDeliveryRow, why, metric string) {
 	ep, err := w.store.DisableEndpoint(ctx, db.DisableEndpointParams{ID: row.EndpointID, Reason: &why})
 	if store.IsNotFound(err) {
 		return // already disabled

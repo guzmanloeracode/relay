@@ -106,14 +106,35 @@ func TestIdempotencyKey(t *testing.T) {
 		t.Fatalf("got %d webhooks for one idempotent event", rcv.count())
 	}
 
-	// After the window the key can be used again.
-	w := e.newWorker()
+	// After the window the key starts a new event (the old one keeps its data, without the key).
 	if _, err := e.st.Pool.Exec(context.Background(), "UPDATE events SET created_at = now() - interval '25 hours'"); err != nil {
 		t.Fatal(err)
 	}
-	w.Cleanup(context.Background())
-	if r := e.call(key, "POST", "/v1/events", body, "Idempotency-Key", "outbox-41"); r.Status != 202 || r.Header.Get("Idempotent-Replayed") != "" {
-		t.Fatalf("released key: %d %v", r.Status, r.Header)
+	r := e.call(key, "POST", "/v1/events", body, "Idempotency-Key", "outbox-41")
+	if r.Status != 202 || r.Header.Get("Idempotent-Replayed") != "" || r.obj(t)["id"] == first.obj(t)["id"] {
+		t.Fatalf("expired key: %d %v %s", r.Status, r.Header, r.Body)
+	}
+	if again := e.call(key, "POST", "/v1/events", body, "Idempotency-Key", "outbox-41"); again.Header.Get("Idempotent-Replayed") != "true" ||
+		again.obj(t)["id"] != r.obj(t)["id"] {
+		t.Fatalf("the new event should own the key now: %s", again.Body)
+	}
+}
+
+func TestRetentionDeletesOldEvents(t *testing.T) {
+	e := newEnv(t, func(c *config.Config) { c.Retention = 50 * time.Millisecond })
+	_, key := e.tenant("acme", nil)
+	rcv := newReceiver(t)
+	e.endpoint(key, "acme", map[string]any{"channel": "webhook", "url": rcv.url(), "event_types": []string{"*"}})
+	e.startWorker()
+	old := e.send(key, map[string]any{"type": "job.done", "payload": map[string]any{}})
+	eventually(t, 5*time.Second, "the webhook", func() bool { return rcv.count() == 1 })
+	time.Sleep(100 * time.Millisecond)
+	e.newWorker().Cleanup(context.Background())
+	if r := e.call(key, "GET", "/v1/tenants/acme/events/"+old, nil); r.Status != 404 {
+		t.Fatalf("old event still there: %d", r.Status)
+	}
+	if n := len(e.deliveries(key, "acme", "")); n != 0 {
+		t.Fatalf("its deliveries remain: %d", n)
 	}
 }
 

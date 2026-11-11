@@ -83,14 +83,15 @@ CREATE TABLE events (
     routed_at       timestamptz,
     delivery_count  integer     NOT NULL DEFAULT 0
 );
--- Keys are released after 24 hours by the cleanup job, so the same key can be used again later.
+-- A key older than 24 hours is released when it is used again (the API clears it and inserts the new event).
 CREATE UNIQUE INDEX events_idempotency ON events (tenant_id, idempotency_key) WHERE idempotency_key IS NOT NULL;
 CREATE INDEX events_tenant ON events (tenant_id, id DESC);
 CREATE INDEX events_unrouted ON events (created_at) WHERE routed_at IS NULL;
-CREATE INDEX events_created ON events (created_at);
+-- IDs are UUIDv7, so the primary key also orders events by time (retention deletes by ID range).
 
 -- One delivery is one event going to one endpoint (and one recipient, for email and push).
--- PostgreSQL holds the state; Redis only carries the IDs that are due.
+-- PostgreSQL holds the state; Redis only carries the IDs that are due. An attempt in progress is held by a slot
+-- in Redis (with a lease), not by a write here: each attempt costs one UPDATE, when its result is recorded.
 CREATE TABLE deliveries (
     id               uuid PRIMARY KEY,
     tenant_id        uuid        NOT NULL REFERENCES tenants (id) ON DELETE CASCADE,
@@ -99,11 +100,10 @@ CREATE TABLE deliveries (
     channel          text        NOT NULL,
     recipient        text        NOT NULL DEFAULT '',
     status           text        NOT NULL DEFAULT 'pending'
-        CHECK (status IN ('pending', 'delivering', 'delivered', 'skipped', 'dead')),
+        CHECK (status IN ('pending', 'delivered', 'skipped', 'dead')),
     attempts         integer     NOT NULL DEFAULT 0,
     max_attempts     integer     NOT NULL,
     next_attempt_at  timestamptz NOT NULL DEFAULT now(),
-    lease_until      timestamptz,
     last_status_code integer,
     last_error       text,
     last_latency_ms  integer,
@@ -113,13 +113,13 @@ CREATE TABLE deliveries (
     created_at       timestamptz NOT NULL DEFAULT now(),
     completed_at     timestamptz
 );
-CREATE UNIQUE INDEX deliveries_route ON deliveries (event_id, endpoint_id, recipient) WHERE replay_of IS NULL;
+-- Routing is idempotent on (event, endpoint, recipient); a replay differs by replay_of. The index also serves
+-- "deliveries of an event" and the cascade when events are deleted.
+CREATE UNIQUE INDEX deliveries_route ON deliveries (event_id, endpoint_id, recipient, replay_of) NULLS NOT DISTINCT;
 CREATE INDEX deliveries_tenant ON deliveries (tenant_id, id DESC);
 CREATE INDEX deliveries_endpoint ON deliveries (endpoint_id, id DESC);
-CREATE INDEX deliveries_event ON deliveries (event_id);
 CREATE INDEX deliveries_dead ON deliveries (tenant_id, id DESC) WHERE status = 'dead' AND replayed_at IS NULL;
 CREATE INDEX deliveries_due ON deliveries (next_attempt_at) WHERE status = 'pending';
-CREATE INDEX deliveries_leased ON deliveries (lease_until) WHERE status = 'delivering';
 
 CREATE TABLE delivery_attempts (
     id            bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,

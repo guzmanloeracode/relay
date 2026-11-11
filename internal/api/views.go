@@ -161,7 +161,7 @@ func deliveryView(d db.Delivery) DeliveryView {
 	if d.Recipient != "" {
 		v.Recipient = &d.Recipient
 	}
-	if d.Status == "pending" || d.Status == "delivering" {
+	if d.Status == "pending" {
 		next := d.NextAttemptAt
 		v.NextAttemptAt = &next
 	}

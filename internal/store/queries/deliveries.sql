@@ -4,45 +4,41 @@ INSERT INTO deliveries (id, tenant_id, event_id, endpoint_id, channel, recipient
 SELECT unnest(sqlc.arg('ids')::uuid[]), unnest(sqlc.arg('tenant_ids')::uuid[]), unnest(sqlc.arg('event_ids')::uuid[]),
        unnest(sqlc.arg('endpoint_ids')::uuid[]), unnest(sqlc.arg('channels')::text[]), unnest(sqlc.arg('recipients')::text[]),
        sqlc.arg('max_attempts')::int
-ON CONFLICT (event_id, endpoint_id, recipient) WHERE replay_of IS NULL DO NOTHING
+ON CONFLICT (event_id, endpoint_id, recipient, replay_of) DO NOTHING
 RETURNING id, tenant_id, endpoint_id;
 
--- name: ClaimDelivery :one
--- Takes a due delivery for one attempt. A message for a delivery that is already done, leased by another
--- worker or not due yet (a stale duplicate) matches nothing, which makes queue redelivery harmless.
-WITH claimed AS (
-    UPDATE deliveries d SET
-        status      = 'delivering',
-        attempts    = d.attempts + 1,
-        lease_until = now() + make_interval(secs => sqlc.arg('lease_seconds')::int)
-    WHERE d.id = sqlc.arg('id')
-      AND d.status = 'pending'
-      AND d.next_attempt_at <= now() + interval '2 seconds'
-      AND EXISTS (SELECT 1 FROM endpoints e WHERE e.id = d.endpoint_id AND e.status = 'active')
-    RETURNING d.id, d.tenant_id, d.event_id, d.endpoint_id, d.channel, d.recipient, d.attempts, d.max_attempts
-)
-SELECT c.id, c.tenant_id, c.event_id, c.endpoint_id, c.channel, c.recipient, c.attempts, c.max_attempts,
+-- name: LoadDelivery :one
+-- Reads a due delivery for an attempt. A message for a delivery that is done or not due yet (a stale
+-- duplicate) matches nothing, which makes queue redelivery harmless. The worker holds the delivery's slot in
+-- Redis while it attempts; the result is written once, by RecordAttempt.
+SELECT d.id, d.tenant_id, d.event_id, d.endpoint_id, d.channel, d.recipient, d.attempts, d.max_attempts,
        ev.type AS event_type, ev.payload, ev.message, ev.created_at AS event_created_at,
        en.url, en.secret_enc, en.previous_secret_enc, en.previous_secret_expires_at, en.email_to,
        t.slug AS tenant_slug
-FROM claimed c
-JOIN events ev ON ev.id = c.event_id
-JOIN endpoints en ON en.id = c.endpoint_id
-JOIN tenants t ON t.id = c.tenant_id;
+FROM deliveries d
+JOIN events ev ON ev.id = d.event_id
+JOIN endpoints en ON en.id = d.endpoint_id
+JOIN tenants t ON t.id = d.tenant_id
+WHERE d.id = sqlc.arg('id')
+  AND d.status = 'pending'
+  AND d.next_attempt_at <= now() + interval '2 seconds'
+  AND en.status = 'active';
 
 -- name: RecordAttempt :execrows
--- Closes the attempt and logs it in one statement. outcome 'retry' puts the delivery back to pending.
+-- Records one attempt and the delivery's next state in one statement. It only applies if nobody recorded an
+-- attempt since the delivery was loaded (attempts unchanged), so a duplicate attempt never counts twice.
+-- outcome 'retry' keeps the delivery pending until next_attempt_at.
 WITH upd AS (
     UPDATE deliveries d SET
         status           = CASE sqlc.arg('outcome')::text WHEN 'retry' THEN 'pending' ELSE sqlc.arg('outcome')::text END,
-        lease_until      = NULL,
+        attempts         = d.attempts + 1,
         next_attempt_at  = sqlc.arg('next_attempt_at')::timestamptz,
         last_status_code = sqlc.narg('status_code')::int,
         last_error       = sqlc.narg('error')::text,
         last_latency_ms  = sqlc.arg('latency_ms')::int,
         dead_reason      = sqlc.narg('dead_reason')::text,
         completed_at     = CASE sqlc.arg('outcome')::text WHEN 'retry' THEN NULL ELSE now() END
-    WHERE d.id = sqlc.arg('id') AND d.status = 'delivering'
+    WHERE d.id = sqlc.arg('id') AND d.status = 'pending' AND d.attempts = sqlc.arg('seen_attempts')::int
     RETURNING d.id, d.attempts
 )
 INSERT INTO delivery_attempts (delivery_id, attempt, started_at, latency_ms, status_code, error, response_body, outcome)
@@ -127,17 +123,6 @@ WHERE d.id IN (
     SELECT id FROM deliveries
     WHERE status = 'pending' AND next_attempt_at < now() - make_interval(secs => sqlc.arg('older_than_seconds')::int)
     ORDER BY next_attempt_at
-    LIMIT sqlc.arg('lim')
-    FOR UPDATE SKIP LOCKED
-)
-RETURNING d.id, d.tenant_id, d.endpoint_id;
-
--- name: ExpireLeases :many
--- A worker died during an attempt: the attempt counts (it may have been sent) and the delivery is due again.
-UPDATE deliveries d SET status = 'pending', lease_until = NULL, next_attempt_at = now()
-WHERE d.id IN (
-    SELECT id FROM deliveries
-    WHERE status = 'delivering' AND lease_until < now()
     LIMIT sqlc.arg('lim')
     FOR UPDATE SKIP LOCKED
 )

@@ -464,7 +464,7 @@ type testHandler struct {
 	attrs []slog.Attr
 }
 
-func (h testHandler) Enabled(_ context.Context, l slog.Level) bool { return l >= slog.LevelWarn }
+func (h testHandler) Enabled(_ context.Context, l slog.Level) bool { return l >= logLevel }
 func (h testHandler) Handle(_ context.Context, r slog.Record) error {
 	if h.done.Load() {
 		return nil
@@ -480,3 +480,10 @@ func (h testHandler) WithAttrs(as []slog.Attr) slog.Handler {
 	return testHandler{t: h.t, done: h.done, attrs: append(h.attrs, as...)}
 }
 func (h testHandler) WithGroup(string) slog.Handler { return h }
+
+var logLevel = func() slog.Level {
+	if os.Getenv("RELAY_TEST_DEBUG") != "" {
+		return slog.LevelDebug
+	}
+	return slog.LevelWarn
+}()

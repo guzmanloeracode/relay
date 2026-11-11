@@ -31,12 +31,13 @@ Redis holds IDs of work that is due, never state that can't be rebuilt:
 
 - An event row is committed before its ID goes to the `relay:events` stream. A delivery row (status, attempts,
   next attempt time) is committed before its ID goes to `relay:deliveries` or the `relay:delayed` set.
-- A worker **claims** a delivery in PostgreSQL (`UPDATE … WHERE status = 'pending' AND next_attempt_at <= now()`)
-  before every attempt. A duplicate or stale queue entry matches nothing, which makes redelivery of queue
-  entries harmless.
-- A **sweeper** on every worker requeues what Redis lost: events never routed, deliveries long overdue and
-  attempts whose lease expired (a worker died mid-attempt). It uses `SKIP LOCKED`, so several workers can sweep
-  at once.
+- An attempt in progress is held by the delivery's **slot in Redis** (a lease), not by a write to PostgreSQL.
+  The worker reads the delivery only if it is still `pending` and due, and records the result with one
+  `UPDATE … WHERE status = 'pending' AND attempts = <what it read>`. A duplicate or stale queue entry matches
+  nothing, and a second attempt never counts twice, which makes redelivery of queue entries harmless.
+- A **sweeper** on every worker requeues what Redis lost: events never routed, deliveries long overdue, and
+  stream entries a dead worker never acknowledged (`XAUTOCLAIM` after the lease). It uses `SKIP LOCKED`, so
+  several workers can sweep at once.
 - Entries are acknowledged and deleted (`XACK` + `XDEL`), so a stream's length is its backlog.
 
 **Limits.** Before claiming, a worker runs one Lua script that takes a slot at the endpoint (its
@@ -45,6 +46,12 @@ slot isn't free the delivery is **parked** in that endpoint's (or tenant's) sort
 and the worker moves on. Releasing a slot wakes the oldest parked delivery, again atomically, so no wake-up is
 lost and parked work costs nothing while it waits. A slow endpoint therefore holds at most its own slots; the
 other tenants' deliveries keep flowing (`TestSlowEndpointDoesNotStarveOthers`).
+
+The first load test showed the cost of the other choice: claiming each delivery with an `UPDATE` before the
+attempt doubled the writes per delivery, and with eight indexes on `deliveries` PostgreSQL saturated its CPU
+on index maintenance and WAL locks at about 200 events a second. Holding the attempt in Redis instead, cutting
+the indexes to what queries use, and committing the worker's writes asynchronously (a lost write only means a
+repeated attempt) removed that ceiling.
 
 ## Consequences
 

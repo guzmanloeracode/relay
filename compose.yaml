@@ -51,7 +51,8 @@ services:
       POSTGRES_DB: relay
     volumes:
       - pgdata:/var/lib/postgresql
-    command: ["postgres", "-c", "shared_buffers=96MB", "-c", "max_connections=80", "-c", "log_min_duration_statement=500"]
+    command: ["postgres", "-c", "shared_buffers=96MB", "-c", "max_connections=80", "-c", "wal_compression=zstd",
+              "-c", "log_min_duration_statement=500"]
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U relay -d relay"]
       interval: 5s

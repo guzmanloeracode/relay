@@ -34,16 +34,14 @@ WHERE routed_at IS NULL AND created_at < now() - make_interval(secs => sqlc.arg(
 ORDER BY created_at
 LIMIT sqlc.arg('lim');
 
--- name: ReleaseIdempotencyKeys :execrows
-UPDATE events e SET idempotency_key = NULL
-WHERE e.id IN (
-    SELECT o.id FROM events o
-    WHERE o.created_at < sqlc.arg('before')::timestamptz AND o.idempotency_key IS NOT NULL
-    LIMIT sqlc.arg('lim')::int
-);
+-- name: ReleaseIdempotencyKey :execrows
+-- Frees an expired key so a new event can use it.
+UPDATE events SET idempotency_key = NULL
+WHERE tenant_id = sqlc.arg('tenant_id') AND id = sqlc.arg('id') AND idempotency_key = sqlc.arg('key')::text;
 
 -- name: DeleteEventsBefore :execrows
--- Deliveries and attempts go with their event (ON DELETE CASCADE).
+-- Deliveries and attempts go with their event (ON DELETE CASCADE). before is a UUIDv7 made from the cutoff
+-- time, so this walks the primary key.
 DELETE FROM events e WHERE e.id IN (
-    SELECT o.id FROM events o WHERE o.created_at < sqlc.arg('before')::timestamptz LIMIT sqlc.arg('lim')::int
+    SELECT o.id FROM events o WHERE o.id < sqlc.arg('before')::uuid ORDER BY o.id LIMIT sqlc.arg('lim')::int
 );

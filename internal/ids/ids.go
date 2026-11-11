@@ -7,6 +7,7 @@ package ids
 import (
 	"errors"
 	"strings"
+	"time"
 
 	"github.com/google/uuid"
 )
@@ -41,6 +42,18 @@ var ErrInvalid = errors.New("invalid id")
 
 // New returns a fresh UUIDv7.
 func New() uuid.UUID { return uuid.Must(uuid.NewV7()) }
+
+// FromTime returns the smallest UUIDv7 of the given millisecond, to compare IDs with a point in time.
+func FromTime(t time.Time) uuid.UUID {
+	var id uuid.UUID
+	ms := uint64(t.UnixMilli())
+	for i := range 6 {
+		id[i] = byte(ms >> (40 - 8*i))
+	}
+	id[6] = 0x70 // version 7
+	id[8] = 0x80 // RFC 9562 variant
+	return id
+}
 
 // Encode writes id as prefix_ followed by 26 base32 characters.
 func Encode(prefix string, id uuid.UUID) string {

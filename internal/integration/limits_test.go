@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/guzmanloeracode/relay/internal/config"
+	"github.com/guzmanloeracode/relay/internal/queue"
 )
 
 // A slow endpoint holds at most its own max_in_flight slots, so another tenant's deliveries go straight through.
@@ -130,19 +131,39 @@ func TestRecoveryAfterRedisDataLoss(t *testing.T) {
 	w.Sweep(context.Background()) // unrouted events go back to the stream
 	eventually(t, 5*time.Second, "the 5 events after the sweep", func() bool { return rcv.count() == 5 })
 
-	// A worker died during an attempt: its lease expires and the sweeper makes the delivery due again.
-	e.send(key, map[string]any{"type": "job.done", "payload": map[string]any{"crash": true}})
-	eventually(t, 5*time.Second, "the 6th webhook", func() bool { return rcv.count() == 6 })
+	// A due delivery whose queue entry was lost (pending in PostgreSQL, nowhere in Redis) is found once overdue.
 	if _, err := e.st.Pool.Exec(context.Background(),
-		`UPDATE deliveries SET status = 'delivering', lease_until = now() - interval '1 second', completed_at = NULL
+		`UPDATE deliveries SET status = 'pending', attempts = 0, completed_at = NULL, next_attempt_at = now() - interval '1 hour'
 		 WHERE id = (SELECT id FROM deliveries ORDER BY id DESC LIMIT 1)`); err != nil {
 		t.Fatal(err)
 	}
 	w.Sweep(context.Background())
-	eventually(t, 5*time.Second, "the redelivery", func() bool { return rcv.count() == 7 })
+	eventually(t, 5*time.Second, "the overdue redelivery", func() bool { return rcv.count() == 6 })
 	if rcv.duplicates() != 1 { // at least once: the consumer dedupes on webhook-id
 		t.Fatalf("duplicates %d", rcv.duplicates())
 	}
+}
+
+// A worker reads an entry and dies before acknowledging it: after the lease, another worker takes it over.
+func TestDeadConsumerEntriesAreTakenOver(t *testing.T) {
+	e := newEnv(t, func(c *config.Config) { c.LeaseDuration = 2 * time.Second })
+	_, key := e.tenant("acme", nil)
+	rcv := newReceiver(t)
+	e.endpoint(key, "acme", map[string]any{"channel": "webhook", "url": rcv.url(), "event_types": []string{"*"}})
+	e.send(key, map[string]any{"type": "job.done", "payload": map[string]any{}})
+	ctx := context.Background()
+	msgs, err := e.q.Read(ctx, queue.EventsStream, queue.RouterGroup, "worker-that-died", 10, 0)
+	if err != nil || len(msgs) != 1 {
+		t.Fatalf("dead consumer read %d: %v", len(msgs), err)
+	}
+	e.startWorker() // reads only new entries, so the dead consumer's entry waits
+	time.Sleep(500 * time.Millisecond)
+	if rcv.count() != 0 {
+		t.Fatal("delivered before the lease passed")
+	}
+	time.Sleep(2 * time.Second)
+	e.newWorker().Sweep(ctx)
+	eventually(t, 5*time.Second, "the taken-over event", func() bool { return rcv.count() == 1 })
 }
 
 func TestGracefulShutdownDrainsAttempts(t *testing.T) {

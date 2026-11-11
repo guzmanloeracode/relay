@@ -224,12 +224,26 @@ func (s *Server) ingest(w http.ResponseWriter, r *http.Request) {
 		params.IdempotencyKey = &idemKey
 	}
 	row, err := s.store.InsertEvent(ctx, params)
-	if store.IsNotFound(err) { // the Idempotency-Key was used before
-		prev, err := s.store.GetEventByIdempotencyKey(ctx, db.GetEventByIdempotencyKeyParams{TenantID: tenant.ID, IdempotencyKey: &idemKey})
-		if err != nil {
-			s.log.Error("loading idempotent event", "err", err)
+	for retried := false; store.IsNotFound(err); retried = true { // the Idempotency-Key was used before
+		prev, err2 := s.store.GetEventByIdempotencyKey(ctx, db.GetEventByIdempotencyKeyParams{TenantID: tenant.ID, IdempotencyKey: &idemKey})
+		if store.IsNotFound(err2) && !retried { // released meanwhile
+			row, err = s.store.InsertEvent(ctx, params)
+			continue
+		}
+		if err2 != nil {
+			s.log.Error("loading idempotent event", "err", err2)
 			internal(w)
 			return
+		}
+		if time.Since(prev.CreatedAt) > s.cfg.IdempotencyTTL && !retried {
+			// The key's window is over: free it and store this request as a new event.
+			if _, err2 := s.store.ReleaseIdempotencyKey(ctx, db.ReleaseIdempotencyKeyParams{TenantID: tenant.ID, ID: prev.ID, Key: idemKey}); err2 != nil {
+				s.log.Error("releasing idempotency key", "err", err2)
+				internal(w)
+				return
+			}
+			row, err = s.store.InsertEvent(ctx, params)
+			continue
 		}
 		if !bytes.Equal(prev.RequestHash, hash[:]) {
 			result = "invalid"

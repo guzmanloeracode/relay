@@ -1057,10 +1057,10 @@ components:
 
     DeliveryStatus:
       type: string
-      enum: [pending, delivering, delivered, skipped, dead]
+      enum: [pending, delivered, skipped, dead]
       description: |
-        `pending` waits for its next attempt, `delivering` is being attempted, `delivered` succeeded,
-        `skipped` had nothing to send (a push user without devices), `dead` is in the dead-letter queue.
+        `pending` waits for its next attempt (or is being attempted), `delivered` succeeded, `skipped` had
+        nothing to send (a push user without devices), `dead` is in the dead-letter queue.
 
     Delivery:
       type: object
