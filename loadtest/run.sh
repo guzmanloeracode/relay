@@ -35,8 +35,12 @@ REDIS_CPUS=2
 EOF
 compose() { docker compose -p "$PROJECT" --env-file "$envfile" -f compose.yaml -f loadtest/compose.yaml --profile observability "$@"; }
 cleanup() {
-  [ "${KEEP:-0}" = "1" ] && { echo "stack left running (docker compose -p $PROJECT … down -v to remove)"; return; }
+  if [ "${KEEP:-0}" = "1" ]; then
+    echo "stack left running: docker compose -p $PROJECT --env-file $envfile -f compose.yaml -f loadtest/compose.yaml --profile observability down -v"
+    return
+  fi
   compose down -v --remove-orphans >/dev/null 2>&1 || true
+  rm -f "$envfile"
 }
 trap cleanup EXIT
 
@@ -120,5 +124,4 @@ with open(f"{out}/report.md", "w") as f:
         f.write(f"| {k} | {v} |\n")
 print(open(f"{out}/report.md").read())
 PY
-rm -f "$envfile"
 exit "$k6_status"
