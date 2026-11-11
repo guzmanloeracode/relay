@@ -9,11 +9,12 @@
 
 - **Relay on two CPUs.** PostgreSQL 18, Redis 8, one API process and one worker process are all pinned to the
   same two cores (`cpuset: "2,3"`), the shape of a 2-vCPU virtual machine. Memory limits are the production
-  ones: API 128 MB, worker 192 MB, PostgreSQL 256 MB, Redis 128 MB.
+  ones: API 128 MB, worker 192 MB, PostgreSQL 384 MB, Redis 128 MB.
 - **Load on the other cores.** k6, the webhook sink, Prometheus and Grafana run on cores 0 and 1, so they don't
   take Relay's CPU time.
-- **Durability as in production.** PostgreSQL commits synchronously (`synchronous_commit=on`, `fsync=on`) and
-  Redis keeps its append-only file; nothing is tuned for the benchmark.
+- **Durability as in production.** The API commits every event synchronously (`fsync=on`), so a `202` means the
+  event is on disk; the worker commits asynchronously, as in production (a lost write only repeats an attempt);
+  Redis keeps its append-only file. Nothing is tuned for the benchmark.
 - **The load:** a constant arrival rate of `POST /v1/events` (k6 `constant-arrival-rate`), each request with its
   own `Idempotency-Key` and a 700-byte payload shaped like a FieldOps `job.completed` event. Each event matches
   one webhook subscription, so every event is also one signed webhook to the sink.
