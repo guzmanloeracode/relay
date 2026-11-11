@@ -11,6 +11,7 @@ export RATE="${RATE:-600}" DURATION="${DURATION:-2m}"
 export TAG="${TAG:-loadtest}"
 OUT="$ROOT/loadtest/results/$(date -u +%Y%m%d-%H%M%S)"
 mkdir -p "$OUT"
+chmod 0777 "$OUT" # k6 runs as an unprivileged user and writes its summary here
 export RESULTS_DIR="$OUT"
 PROJECT=relay-load
 
@@ -64,6 +65,11 @@ done
 drained="$(date +%s)"
 kill "$sampler" 2>/dev/null || true
 curl -fsS http://127.0.0.1:18190/stats > "$OUT/sink.json"
+# Where PostgreSQL spent its time.
+compose exec -T postgres psql -U relay -d relay -c "CREATE EXTENSION IF NOT EXISTS pg_stat_statements" >/dev/null
+compose exec -T postgres psql -U relay -d relay -c "SELECT calls, round(total_exec_time) AS total_ms,
+  round(mean_exec_time::numeric, 2) AS mean_ms, rows, left(regexp_replace(query, '\s+', ' ', 'g'), 90) AS query
+  FROM pg_stat_statements ORDER BY total_exec_time DESC LIMIT 15" > "$OUT/pg-statements.txt" || true
 
 # Server-side numbers from Prometheus over the run.
 q() { curl -fsS --get http://127.0.0.1:19090/api/v1/query --data-urlencode "query=$1" --data-urlencode "time=$end"; }
