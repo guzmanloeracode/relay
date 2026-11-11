@@ -40,7 +40,7 @@ Redis holds IDs of work that is due, never state that can't be rebuilt:
   several workers can sweep at once.
 - Entries are acknowledged and deleted (`XACK` + `XDEL`), so a stream's length is its backlog.
 
-**Limits.** Before claiming, a worker runs one Lua script that takes a slot at the endpoint (its
+**Limits.** Before an attempt, a worker runs one Lua script that takes a slot at the endpoint (its
 `max_in_flight`), a slot at the tenant, and a token from the tenant's delivery bucket, all or nothing. When a
 slot isn't free the delivery is **parked** in that endpoint's (or tenant's) sorted set inside the same script,
 and the worker moves on. Releasing a slot wakes the oldest parked delivery, again atomically, so no wake-up is
