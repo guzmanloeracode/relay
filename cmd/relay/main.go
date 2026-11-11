@@ -165,7 +165,10 @@ func runAPI(ctx context.Context, cfg config.Config, st *store.Store, q *queue.Qu
 	if err != nil {
 		return err
 	}
-	go s.ListenInvalidations(ctx)
+	// The event writer outlives ctx until the server has finished its last request, which may be waiting on it.
+	background, stopBackground := context.WithCancel(context.WithoutCancel(ctx))
+	defer stopBackground()
+	s.Start(background)
 	srv := &http.Server{
 		Addr:              cfg.Addr,
 		Handler:           s.Handler(),
@@ -174,7 +177,9 @@ func runAPI(ctx context.Context, cfg config.Config, st *store.Store, q *queue.Qu
 		WriteTimeout:      30 * time.Second,
 		IdleTimeout:       120 * time.Second,
 	}
+	shutdownDone := make(chan struct{})
 	go func() {
+		defer close(shutdownDone)
 		<-ctx.Done()
 		// Stop accepting, finish the requests in progress.
 		c, cancel := context.WithTimeout(context.WithoutCancel(ctx), cfg.ShutdownTimeout)
@@ -185,6 +190,7 @@ func runAPI(ctx context.Context, cfg config.Config, st *store.Store, q *queue.Qu
 	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		return err
 	}
+	<-shutdownDone
 	return nil
 }
 

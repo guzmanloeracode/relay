@@ -160,6 +160,68 @@ func (q *Queries) InsertEvent(ctx context.Context, arg InsertEventParams) (Inser
 	return i, err
 }
 
+const insertEvents = `-- name: InsertEvents :many
+INSERT INTO events (id, tenant_id, type, payload, message, targets, idempotency_key, request_hash)
+SELECT u.id, u.tenant_id, u.type, u.payload::jsonb, NULLIF(u.message, '')::jsonb, NULLIF(u.targets, '')::jsonb,
+       NULLIF(u.idem_key, ''), u.request_hash
+FROM (
+    SELECT unnest($1::uuid[]) AS id, unnest($2::uuid[]) AS tenant_id,
+           unnest($3::text[]) AS type, unnest($4::text[]) AS payload,
+           unnest($5::text[]) AS message, unnest($6::text[]) AS targets,
+           unnest($7::text[]) AS idem_key, unnest($8::bytea[]) AS request_hash
+) AS u
+ON CONFLICT (tenant_id, idempotency_key) WHERE idempotency_key IS NOT NULL DO NOTHING
+RETURNING id, created_at
+`
+
+type InsertEventsParams struct {
+	Ids           []uuid.UUID
+	TenantIds     []uuid.UUID
+	Types         []string
+	Payloads      []string
+	Messages      []string
+	Targets       []string
+	IdemKeys      []string
+	RequestHashes [][]byte
+}
+
+type InsertEventsRow struct {
+	ID        uuid.UUID
+	CreatedAt time.Time
+}
+
+// Many requests' events in one statement and one commit (the API's group commit). Rows whose
+// Idempotency-Key was used before are skipped; the caller handles those one by one. Empty strings stand for
+// NULL in the optional columns.
+func (q *Queries) InsertEvents(ctx context.Context, arg InsertEventsParams) ([]InsertEventsRow, error) {
+	rows, err := q.db.Query(ctx, insertEvents,
+		arg.Ids,
+		arg.TenantIds,
+		arg.Types,
+		arg.Payloads,
+		arg.Messages,
+		arg.Targets,
+		arg.IdemKeys,
+		arg.RequestHashes,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []InsertEventsRow{}
+	for rows.Next() {
+		var i InsertEventsRow
+		if err := rows.Scan(&i.ID, &i.CreatedAt); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listEvents = `-- name: ListEvents :many
 SELECT id, tenant_id, type, payload, message, targets, idempotency_key, request_hash, created_at, routed_at, delivery_count FROM events
 WHERE tenant_id = $1

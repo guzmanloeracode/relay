@@ -223,7 +223,16 @@ func (s *Server) ingest(w http.ResponseWriter, r *http.Request) {
 	if idemKey != "" {
 		params.IdempotencyKey = &idemKey
 	}
-	row, err := s.store.InsertEvent(ctx, params)
+	var row db.InsertEventRow
+	res := s.writer.write(ctx, params)
+	err = res.err
+	switch {
+	case err != nil:
+	case res.conflict:
+		err = store.ErrNotFound
+	default:
+		row = db.InsertEventRow{ID: res.id, CreatedAt: res.createdAt}
+	}
 	for retried := false; store.IsNotFound(err); retried = true { // the Idempotency-Key was used before
 		prev, err2 := s.store.GetEventByIdempotencyKey(ctx, db.GetEventByIdempotencyKeyParams{TenantID: tenant.ID, IdempotencyKey: &idemKey})
 		if store.IsNotFound(err2) && !retried { // released meanwhile

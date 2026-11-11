@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -430,5 +431,52 @@ func TestSchedulePayloadSurvivesAsJSON(t *testing.T) {
 	_ = json.Unmarshal(ev.Payload, &back)
 	if fmt.Sprint(back) != fmt.Sprint(payload) || !strings.Contains(string(ev.Message), `"title":"Done"`) || !strings.Contains(string(ev.Targets), `"u1"`) {
 		t.Fatalf("event %s %s %s", ev.Payload, ev.Message, ev.Targets)
+	}
+}
+
+// Concurrent requests share batches in the API's group commit: duplicates of one Idempotency-Key inside a batch
+// still end up as one event, and every other request gets its own.
+func TestConcurrentIngestBatches(t *testing.T) {
+	e := newEnv(t, nil)
+	_, key := e.tenant("acme", map[string]any{"ingest_rate": 1000, "ingest_burst": 1000})
+	const n = 60
+	ids := make(chan string, 2*n)
+	var wg sync.WaitGroup
+	for i := range n {
+		wg.Go(func() {
+			r := e.call(key, "POST", "/v1/events", map[string]any{"type": "job.done", "payload": map[string]any{"same": true}},
+				"Idempotency-Key", "same-key")
+			if r.Status != 202 {
+				t.Errorf("duplicate %d: %d %s", i, r.Status, r.Body)
+				return
+			}
+			ids <- "same:" + r.obj(t)["id"].(string)
+		})
+		wg.Go(func() {
+			r := e.call(key, "POST", "/v1/events", map[string]any{"type": "job.done", "payload": map[string]any{"n": i}},
+				"Idempotency-Key", fmt.Sprintf("key-%d", i))
+			if r.Status != 202 {
+				t.Errorf("distinct %d: %d %s", i, r.Status, r.Body)
+				return
+			}
+			ids <- "own:" + r.obj(t)["id"].(string)
+		})
+	}
+	wg.Wait()
+	close(ids)
+	same, own := map[string]bool{}, map[string]bool{}
+	for id := range ids {
+		if k, v, _ := strings.Cut(id, ":"); k == "same" {
+			same[v] = true
+		} else {
+			own[v] = true
+		}
+	}
+	if len(same) != 1 || len(own) != n {
+		t.Fatalf("one shared event and %d distinct ones expected, got %d and %d", n, len(same), len(own))
+	}
+	var count int
+	if err := e.st.Pool.QueryRow(context.Background(), "SELECT count(*) FROM events").Scan(&count); err != nil || count != n+1 {
+		t.Fatalf("%d events stored (%v)", count, err)
 	}
 }

@@ -126,7 +126,9 @@ func (w *Worker) Run(ctx context.Context) error {
 		})
 	}
 	go w.listenInvalidations(ctx)
-	start("router", w.routeLoop)
+	for range routers {
+		start("router", w.routeLoop) // several, so one slow batch doesn't hold routing up
+	}
 	start("deliver", func(ctx context.Context) { w.deliverLoop(ctx, workCtx) })
 	start("promote", w.promoteLoop)
 	start("sweep", w.sweepLoop)

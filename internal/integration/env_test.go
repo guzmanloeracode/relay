@@ -200,7 +200,7 @@ func newEnv(t *testing.T, tweak func(*relayconfig.Config)) *env {
 		t.Fatal(err)
 	}
 	apiCtx, stopAPI := context.WithCancel(ctx)
-	go s.ListenInvalidations(apiCtx)
+	s.Start(apiCtx)
 	srv := httptest.NewServer(s.Handler())
 
 	e := &env{t: t, cfg: cfg, st: st, rdb: rdb, q: q, srv: srv}

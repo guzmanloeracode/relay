@@ -37,6 +37,7 @@ type Server struct {
 	keys    *cache.Cache[string, cachedKey]
 	tenants *cache.Cache[string, db.Tenant] // by slug
 	touched *cache.Cache[uuid.UUID, bool]   // keys whose last_used_at was written recently
+	writer  *eventWriter
 }
 
 type cachedKey struct {
@@ -56,7 +57,21 @@ func New(cfg config.Config, st *store.Store, q *queue.Queue, log *slog.Logger, m
 		keys:    cache.New[string, cachedKey](30*time.Second, 100_000),
 		tenants: cache.New[string, db.Tenant](30*time.Second, 100_000),
 		touched: cache.New[uuid.UUID, bool](5*time.Minute, 100_000),
+		writer:  newEventWriter(st, writerFlushers, writerBatch),
 	}, nil
+}
+
+// Flushers write batches in parallel, each on its own connection; a batch holds up to writerBatch events.
+const (
+	writerFlushers = 8
+	writerBatch    = 128
+)
+
+// Start runs the background parts of the API (the event writer and the cache invalidation listener) until ctx
+// ends. Call it before serving requests.
+func (s *Server) Start(ctx context.Context) {
+	s.writer.run(ctx, writerFlushers)
+	go s.ListenInvalidations(ctx)
 }
 
 // ListenInvalidations drops cache entries that other processes changed, until ctx ends.

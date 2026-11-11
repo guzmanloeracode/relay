@@ -15,7 +15,10 @@ import (
 	"github.com/guzmanloeracode/relay/internal/store/db"
 )
 
-const routeBatch = 200
+const (
+	routeBatch = 200
+	routers    = 4 // routing loops per worker process
+)
 
 func (w *Worker) routeLoop(ctx context.Context) {
 	for ctx.Err() == nil {

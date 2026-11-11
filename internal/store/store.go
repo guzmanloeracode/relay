@@ -109,6 +109,9 @@ func MigrationStatus(ctx context.Context, url string) ([]*goose.MigrationStatus,
 	return provider.Status(ctx)
 }
 
+// ErrNotFound is the error of a query that matched no row.
+var ErrNotFound = pgx.ErrNoRows
+
 // IsNotFound reports whether err means the query matched no row.
 func IsNotFound(err error) bool { return errors.Is(err, pgx.ErrNoRows) }
 
