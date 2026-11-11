@@ -1,0 +1,1325 @@
+openapi: 3.1.0
+info:
+  title: Relay API
+  version: 1.0.0
+  summary: Event delivery for webhooks, email and push, with retries and a delivery log.
+  description: |
+    Relay takes events from your application and delivers them to each tenant's endpoints: signed webhooks,
+    emails and Expo push notifications. Deliveries are retried with exponential backoff for up to 24 hours,
+    then kept in a dead-letter queue that can be replayed.
+
+    ## Authentication
+    Send an API key as `Authorization: Bearer rk_…`. A key is either bound to one tenant or works for every
+    tenant (a service key). Scopes: `ingest` (send events), `read` (logs and configuration), `manage`
+    (endpoints, subscriptions, push tokens, replays) and `admin` (tenants and keys; only on keys that are not
+    bound to a tenant). A key that can't see a tenant gets `404` for it, as if it didn't exist.
+
+    ## Webhooks
+    Every webhook is a `POST` with a JSON body `{id, type, tenant, created_at, data}` and the
+    [Standard Webhooks](https://www.standardwebhooks.com) headers `webhook-id` (the event ID, the same on
+    every retry), `webhook-timestamp` and `webhook-signature` (`v1,<base64 HMAC-SHA256>` over
+    `<id>.<timestamp>.<body>` with the endpoint's secret). Reject timestamps more than 5 minutes off to
+    block replays, and drop event IDs you already processed: delivery is at least once. Any `2xx` within 10
+    seconds is a success; `410 Gone` disables the endpoint; anything else is retried.
+
+    ## Errors
+    Errors use RFC 9457 problem details (`application/problem+json`) with `type`, `title`, `status`, a
+    stable `code`, `detail` and, for validation failures, `errors[]` listing each field.
+
+    ## Pagination
+    Lists return `{data, next_cursor}`, newest first. Pass `next_cursor` as `?cursor=` for the next page;
+    it is `null` on the last one. `limit` is 1–100 (default 50).
+
+    ## Idempotency
+    `POST /v1/events` accepts an `Idempotency-Key` header (1–255 visible ASCII characters). Sending the same
+    key and body again within 24 hours returns the original event with `Idempotent-Replayed: true`; the same
+    key with a different body returns `422`.
+
+    ## Rate limits
+    Ingestion is limited per tenant (a token bucket: `ingest_rate` events a second, bursts of
+    `ingest_burst`); other calls are limited to 50 a second per key. A `429` carries `Retry-After`.
+  license:
+    name: MIT
+    identifier: MIT
+  contact:
+    name: Relay on GitHub
+    url: https://github.com/guzmanloeracode/relay
+servers:
+  - url: https://relay.tinggalpake.com
+    description: Public instance
+  - url: http://localhost:8080
+    description: Local Docker Compose stack
+security:
+  - apiKey: []
+tags:
+  - name: Events
+  - name: Deliveries
+  - name: Endpoints
+  - name: Subscriptions
+  - name: Push tokens
+  - name: Tenants
+  - name: API keys
+  - name: Service
+
+paths:
+  /v1/events:
+    post:
+      tags: [Events]
+      operationId: ingestEvent
+      summary: Send an event
+      description: Stores the event and returns at once; routing and delivery happen in the background.
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/EventIn" }
+            example:
+              tenant: acme-air
+              type: job.completed
+              payload: { job: J-1042, technician: Tom, completed_at: "2026-11-11T09:30:00Z" }
+              message: { title: Job J-1042 completed, body: Tom finished the AC service at 12 Oak St., url: "https://app.example.com/jobs/J-1042" }
+              targets: { users: [user_dispatcher_1] }
+      responses:
+        "202":
+          description: Accepted. Delivery happens in the background.
+          headers:
+            Location: { $ref: "#/components/headers/Location" }
+            Idempotent-Replayed:
+              description: "`true` when the same Idempotency-Key and body were sent before."
+              schema: { type: string, enum: ["true"] }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Accepted" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "413": { $ref: "#/components/responses/TooLarge" }
+        "422": { $ref: "#/components/responses/Invalid" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+
+  /v1/tenants/{tenant}/events:
+    get:
+      tags: [Events]
+      operationId: listEvents
+      summary: List events
+      parameters:
+        - $ref: "#/components/parameters/Tenant"
+        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/Cursor"
+        - { name: type, in: query, description: Only events of this type., schema: { type: string } }
+      responses:
+        "200":
+          description: Events, newest first.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/EventList" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "422": { $ref: "#/components/responses/Invalid" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+
+  /v1/tenants/{tenant}/events/{id}:
+    get:
+      tags: [Events]
+      operationId: getEvent
+      summary: Get an event with its deliveries
+      parameters:
+        - $ref: "#/components/parameters/Tenant"
+        - { name: id, in: path, required: true, schema: { type: string, pattern: "^evt_" } }
+      responses:
+        "200":
+          description: The event and every delivery made for it.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/EventWithDeliveries" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+
+  /v1/tenants/{tenant}/deliveries:
+    get:
+      tags: [Deliveries]
+      operationId: listDeliveries
+      summary: List deliveries
+      description: The delivery log, filtered by event, endpoint or status.
+      parameters:
+        - $ref: "#/components/parameters/Tenant"
+        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/Cursor"
+        - { name: event_id, in: query, schema: { type: string, pattern: "^evt_" } }
+        - { name: endpoint_id, in: query, schema: { type: string, pattern: "^ep_" } }
+        - { name: status, in: query, schema: { $ref: "#/components/schemas/DeliveryStatus" } }
+      responses:
+        "200":
+          description: Deliveries, newest first.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DeliveryList" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "422": { $ref: "#/components/responses/Invalid" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+
+  /v1/tenants/{tenant}/deliveries/{id}:
+    get:
+      tags: [Deliveries]
+      operationId: getDelivery
+      summary: Get a delivery with every attempt
+      parameters:
+        - $ref: "#/components/parameters/Tenant"
+        - $ref: "#/components/parameters/DeliveryID"
+      responses:
+        "200":
+          description: The delivery and its attempts, with status codes, latencies and errors.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DeliveryWithAttempts" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+
+  /v1/tenants/{tenant}/deliveries/{id}/replay:
+    post:
+      tags: [Deliveries]
+      operationId: replayDelivery
+      summary: Replay a dead delivery
+      description: Creates a new delivery of the same event to the same endpoint, with a fresh set of attempts.
+      parameters:
+        - $ref: "#/components/parameters/Tenant"
+        - $ref: "#/components/parameters/DeliveryID"
+      responses:
+        "202":
+          description: The new delivery.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Delivery" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+
+  /v1/tenants/{tenant}/dead-letters:
+    get:
+      tags: [Deliveries]
+      operationId: listDeadLetters
+      summary: List the dead-letter queue
+      description: Deliveries that ran out of attempts, were rejected for good, or belong to a disabled endpoint, and were not replayed yet.
+      parameters:
+        - $ref: "#/components/parameters/Tenant"
+        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/Cursor"
+        - { name: endpoint_id, in: query, schema: { type: string, pattern: "^ep_" } }
+      responses:
+        "200":
+          description: Dead deliveries, newest first.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DeliveryList" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "422": { $ref: "#/components/responses/Invalid" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+
+  /v1/tenants/{tenant}/dead-letters/replay:
+    post:
+      tags: [Deliveries]
+      operationId: replayDeadLetters
+      summary: Replay dead deliveries in bulk
+      description: Replays the oldest dead deliveries of active endpoints, optionally of one endpoint only.
+      parameters:
+        - $ref: "#/components/parameters/Tenant"
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              properties:
+                endpoint_id: { type: string, pattern: "^ep_" }
+                limit: { type: integer, minimum: 1, maximum: 1000, default: 100 }
+      responses:
+        "202":
+          description: How many deliveries were replayed.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [replayed]
+                properties:
+                  replayed: { type: integer, minimum: 0 }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "422": { $ref: "#/components/responses/Invalid" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+
+  /v1/tenants/{tenant}/endpoints:
+    get:
+      tags: [Endpoints]
+      operationId: listEndpoints
+      summary: List endpoints
+      parameters:
+        - $ref: "#/components/parameters/Tenant"
+        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/Cursor"
+      responses:
+        "200":
+          description: Endpoints, newest first.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/EndpointList" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "422": { $ref: "#/components/responses/Invalid" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+    post:
+      tags: [Endpoints]
+      operationId: createEndpoint
+      summary: Create an endpoint
+      description: |
+        A webhook endpoint gets a signing secret, returned once here (and later from `GET …/secret`).
+        `event_types` also creates a subscription, so one call is enough to start receiving events.
+      parameters:
+        - $ref: "#/components/parameters/Tenant"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/EndpointIn" }
+            example: { channel: webhook, url: "https://example.com/hooks/relay", description: Job updates, event_types: ["job.*"] }
+      responses:
+        "201":
+          description: The endpoint, with its secret for a webhook.
+          headers:
+            Location: { $ref: "#/components/headers/Location" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Endpoint" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "422": { $ref: "#/components/responses/Invalid" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+
+  /v1/tenants/{tenant}/endpoints/{id}:
+    parameters:
+      - $ref: "#/components/parameters/Tenant"
+      - $ref: "#/components/parameters/EndpointID"
+    get:
+      tags: [Endpoints]
+      operationId: getEndpoint
+      summary: Get an endpoint
+      responses:
+        "200":
+          description: The endpoint, with its failure streak.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Endpoint" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+    patch:
+      tags: [Endpoints]
+      operationId: updateEndpoint
+      summary: Update an endpoint
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/EndpointPatch" }
+      responses:
+        "200":
+          description: The updated endpoint.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Endpoint" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "422": { $ref: "#/components/responses/Invalid" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+    delete:
+      tags: [Endpoints]
+      operationId: deleteEndpoint
+      summary: Delete an endpoint
+      description: Deletes the endpoint, its subscriptions and its deliveries.
+      responses:
+        "204": { description: Deleted. }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+
+  /v1/tenants/{tenant}/endpoints/{id}/secret:
+    get:
+      tags: [Endpoints]
+      operationId: getEndpointSecret
+      summary: Get a webhook's signing secret
+      parameters:
+        - $ref: "#/components/parameters/Tenant"
+        - $ref: "#/components/parameters/EndpointID"
+      responses:
+        "200":
+          description: The current secret.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [secret]
+                properties:
+                  secret: { type: string, pattern: "^whsec_" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+
+  /v1/tenants/{tenant}/endpoints/{id}/rotate-secret:
+    post:
+      tags: [Endpoints]
+      operationId: rotateEndpointSecret
+      summary: Rotate a webhook's signing secret
+      description: Returns a new secret. For the next 24 hours requests carry a signature with the old secret too, so receivers can switch without dropping requests.
+      parameters:
+        - $ref: "#/components/parameters/Tenant"
+        - $ref: "#/components/parameters/EndpointID"
+      responses:
+        "200":
+          description: The endpoint with its new secret.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Endpoint" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+
+  /v1/tenants/{tenant}/endpoints/{id}/enable:
+    post:
+      tags: [Endpoints]
+      operationId: enableEndpoint
+      summary: Enable an endpoint
+      description: Turns a disabled endpoint back on and clears its failure streak. Replay its dead letters to send what it missed.
+      parameters:
+        - $ref: "#/components/parameters/Tenant"
+        - $ref: "#/components/parameters/EndpointID"
+      responses:
+        "200":
+          description: The endpoint.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Endpoint" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+
+  /v1/tenants/{tenant}/endpoints/{id}/disable:
+    post:
+      tags: [Endpoints]
+      operationId: disableEndpoint
+      summary: Disable an endpoint
+      description: Stops deliveries to the endpoint. Its pending deliveries move to the dead-letter queue.
+      parameters:
+        - $ref: "#/components/parameters/Tenant"
+        - $ref: "#/components/parameters/EndpointID"
+      responses:
+        "200":
+          description: The endpoint.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Endpoint" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+
+  /v1/tenants/{tenant}/subscriptions:
+    get:
+      tags: [Subscriptions]
+      operationId: listSubscriptions
+      summary: List subscriptions
+      parameters:
+        - $ref: "#/components/parameters/Tenant"
+        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/Cursor"
+        - { name: endpoint_id, in: query, schema: { type: string, pattern: "^ep_" } }
+      responses:
+        "200":
+          description: Subscriptions, newest first.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SubscriptionList" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "422": { $ref: "#/components/responses/Invalid" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+    post:
+      tags: [Subscriptions]
+      operationId: createSubscription
+      summary: Subscribe an endpoint to event types
+      parameters:
+        - $ref: "#/components/parameters/Tenant"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/SubscriptionIn" }
+      responses:
+        "201":
+          description: The subscription.
+          headers:
+            Location: { $ref: "#/components/headers/Location" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Subscription" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "422": { $ref: "#/components/responses/Invalid" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+
+  /v1/tenants/{tenant}/subscriptions/{id}:
+    parameters:
+      - $ref: "#/components/parameters/Tenant"
+      - { name: id, in: path, required: true, schema: { type: string, pattern: "^sub_" } }
+    get:
+      tags: [Subscriptions]
+      operationId: getSubscription
+      summary: Get a subscription
+      responses:
+        "200":
+          description: The subscription.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Subscription" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+    patch:
+      tags: [Subscriptions]
+      operationId: updateSubscription
+      summary: Change a subscription's event types
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [event_types]
+              properties:
+                event_types: { $ref: "#/components/schemas/EventTypes" }
+      responses:
+        "200":
+          description: The subscription.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Subscription" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "422": { $ref: "#/components/responses/Invalid" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+    delete:
+      tags: [Subscriptions]
+      operationId: deleteSubscription
+      summary: Delete a subscription
+      responses:
+        "204": { description: Deleted. }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+
+  /v1/tenants/{tenant}/push-tokens:
+    get:
+      tags: [Push tokens]
+      operationId: listPushTokens
+      summary: List registered devices
+      parameters:
+        - $ref: "#/components/parameters/Tenant"
+        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/Cursor"
+        - { name: user, in: query, description: Only this user's devices., schema: { type: string } }
+      responses:
+        "200":
+          description: Devices, newest first.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PushTokenList" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "422": { $ref: "#/components/responses/Invalid" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+    put:
+      tags: [Push tokens]
+      operationId: putPushToken
+      summary: Register a device
+      description: Registers an Expo push token for a user, or moves it to this user if it was registered before.
+      parameters:
+        - $ref: "#/components/parameters/Tenant"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/PushTokenIn" }
+      responses:
+        "200":
+          description: The registered device.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PushToken" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "422": { $ref: "#/components/responses/Invalid" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+
+  /v1/tenants/{tenant}/push-tokens/{id}:
+    delete:
+      tags: [Push tokens]
+      operationId: deletePushToken
+      summary: Remove a device
+      parameters:
+        - $ref: "#/components/parameters/Tenant"
+        - { name: id, in: path, required: true, schema: { type: string, pattern: "^ptk_" } }
+      responses:
+        "204": { description: Removed. }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+
+  /v1/tenants:
+    get:
+      tags: [Tenants]
+      operationId: listTenants
+      summary: List tenants
+      description: Needs the `admin` scope.
+      parameters:
+        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/Cursor"
+      responses:
+        "200":
+          description: Tenants, newest first.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/TenantList" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "422": { $ref: "#/components/responses/Invalid" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+    post:
+      tags: [Tenants]
+      operationId: createTenant
+      summary: Create a tenant
+      description: Needs the `admin` scope.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/TenantIn" }
+            example: { slug: acme-air, name: Acme Air Services }
+      responses:
+        "201":
+          description: The tenant.
+          headers:
+            Location: { $ref: "#/components/headers/Location" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Tenant" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "409": { $ref: "#/components/responses/Conflict" }
+        "422": { $ref: "#/components/responses/Invalid" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+
+  /v1/tenants/{tenant}:
+    parameters:
+      - $ref: "#/components/parameters/Tenant"
+    get:
+      tags: [Tenants]
+      operationId: getTenant
+      summary: Get a tenant
+      responses:
+        "200":
+          description: The tenant and its limits.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Tenant" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+    patch:
+      tags: [Tenants]
+      operationId: updateTenant
+      summary: Update a tenant
+      description: Renames it, changes its limits, or disables it (its keys and ingestion stop). Needs the `admin` scope.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/TenantPatch" }
+      responses:
+        "200":
+          description: The tenant.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Tenant" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "422": { $ref: "#/components/responses/Invalid" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+
+  /v1/tenants/{tenant}/keys:
+    parameters:
+      - $ref: "#/components/parameters/Tenant"
+    get:
+      tags: [API keys]
+      operationId: listTenantKeys
+      summary: List a tenant's keys
+      responses:
+        "200":
+          description: The keys (never the secret part).
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/KeyList" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+    post:
+      tags: [API keys]
+      operationId: createTenantKey
+      summary: Create a key for a tenant
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/KeyIn" }
+      responses:
+        "201":
+          description: The key. `key` is shown only in this response.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/APIKey" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "422": { $ref: "#/components/responses/Invalid" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+
+  /v1/tenants/{tenant}/keys/{id}:
+    delete:
+      tags: [API keys]
+      operationId: revokeTenantKey
+      summary: Revoke a tenant's key
+      parameters:
+        - $ref: "#/components/parameters/Tenant"
+        - $ref: "#/components/parameters/KeyID"
+      responses:
+        "204": { description: Revoked. }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+
+  /v1/keys:
+    get:
+      tags: [API keys]
+      operationId: listGlobalKeys
+      summary: List service and admin keys
+      description: Keys that are not bound to a tenant.
+      responses:
+        "200":
+          description: The keys.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/KeyList" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+    post:
+      tags: [API keys]
+      operationId: createGlobalKey
+      summary: Create a service or admin key
+      description: A key for every tenant, such as the one your application uses to send events for all of its customers.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/KeyIn" }
+            example: { name: FieldOps worker, scopes: [ingest, read, manage] }
+      responses:
+        "201":
+          description: The key. `key` is shown only in this response.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/APIKey" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "422": { $ref: "#/components/responses/Invalid" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+
+  /v1/keys/{id}:
+    delete:
+      tags: [API keys]
+      operationId: revokeGlobalKey
+      summary: Revoke a service or admin key
+      parameters:
+        - $ref: "#/components/parameters/KeyID"
+      responses:
+        "204": { description: Revoked. }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+
+  /healthz:
+    get:
+      tags: [Service]
+      operationId: health
+      summary: Liveness and version
+      security: []
+      responses:
+        "200":
+          description: The process is up.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Health" }
+
+  /readyz:
+    get:
+      tags: [Service]
+      operationId: ready
+      summary: Readiness (PostgreSQL and Redis)
+      security: []
+      responses:
+        "200":
+          description: Both stores answer.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Health" }
+        "503":
+          description: A store doesn't answer.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Health" }
+
+components:
+  securitySchemes:
+    apiKey:
+      type: http
+      scheme: bearer
+      description: An API key (`rk_…`).
+
+  parameters:
+    Tenant:
+      name: tenant
+      in: path
+      required: true
+      description: The tenant's slug.
+      schema: { type: string, pattern: "^[a-z0-9][a-z0-9_-]{0,62}$" }
+    DeliveryID:
+      name: id
+      in: path
+      required: true
+      schema: { type: string, pattern: "^dlv_" }
+    EndpointID:
+      name: id
+      in: path
+      required: true
+      schema: { type: string, pattern: "^ep_" }
+    KeyID:
+      name: id
+      in: path
+      required: true
+      schema: { type: string, pattern: "^key_" }
+    Limit:
+      name: limit
+      in: query
+      schema: { type: integer, minimum: 1, maximum: 100, default: 50 }
+    Cursor:
+      name: cursor
+      in: query
+      description: The `next_cursor` of the previous page.
+      schema: { type: string }
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      description: Makes retries of the same request safe for 24 hours.
+      schema: { type: string, minLength: 1, maxLength: 255 }
+
+  headers:
+    Location:
+      description: The new resource.
+      schema: { type: string }
+    RetryAfter:
+      description: Seconds to wait before trying again.
+      schema: { type: integer, minimum: 1 }
+
+  responses:
+    BadRequest:
+      description: The body is not valid JSON.
+      content:
+        application/problem+json:
+          schema: { $ref: "#/components/schemas/Problem" }
+    Unauthenticated:
+      description: No API key, or one that is not valid.
+      content:
+        application/problem+json:
+          schema: { $ref: "#/components/schemas/Problem" }
+    Forbidden:
+      description: The key lacks a scope, or its tenant is disabled.
+      content:
+        application/problem+json:
+          schema: { $ref: "#/components/schemas/Problem" }
+    NotFound:
+      description: No such resource for this key.
+      content:
+        application/problem+json:
+          schema: { $ref: "#/components/schemas/Problem" }
+    Conflict:
+      description: The request conflicts with the resource's state.
+      content:
+        application/problem+json:
+          schema: { $ref: "#/components/schemas/Problem" }
+    TooLarge:
+      description: The body is larger than 512 KB.
+      content:
+        application/problem+json:
+          schema: { $ref: "#/components/schemas/Problem" }
+    Invalid:
+      description: One or more fields are invalid.
+      content:
+        application/problem+json:
+          schema: { $ref: "#/components/schemas/Problem" }
+    RateLimited:
+      description: Too many requests. Wait `Retry-After` seconds.
+      headers:
+        Retry-After: { $ref: "#/components/headers/RetryAfter" }
+      content:
+        application/problem+json:
+          schema: { $ref: "#/components/schemas/Problem" }
+
+  schemas:
+    Problem:
+      type: object
+      description: RFC 9457 problem details.
+      required: [type, title, status, code]
+      properties:
+        type: { type: string, format: uri }
+        title: { type: string }
+        status: { type: integer }
+        code: { type: string, description: "A stable error code, documented in docs/errors.md." }
+        detail: { type: string }
+        errors:
+          type: array
+          items:
+            type: object
+            required: [path, message]
+            properties:
+              path: { type: string }
+              message: { type: string }
+
+    Timestamp: { type: string, format: date-time }
+    NullableTimestamp: { type: [string, "null"], format: date-time }
+
+    EventType:
+      type: string
+      maxLength: 128
+      pattern: "^[a-z][a-z0-9_]*(\\.[a-z0-9_]+)+$"
+      description: Lower-case words separated by dots, such as `job.completed`. The `relay.` prefix is reserved.
+
+    EventTypes:
+      type: array
+      minItems: 1
+      maxItems: 50
+      description: 'Exact types (`job.completed`), prefixes (`job.*`) or `"*"` for every event.'
+      items: { type: string, maxLength: 128 }
+
+    Message:
+      type: object
+      additionalProperties: false
+      description: The human-readable part of an event. Email and push deliveries need it.
+      required: [title]
+      properties:
+        title: { type: string, minLength: 1, maxLength: 200, description: "Email subject and push title." }
+        body: { type: string, maxLength: 4000 }
+        url: { type: string, maxLength: 2048, description: "A link added to the email and the push data: a web URL or an app link (myapp://jobs/42)." }
+        html: { type: string, maxLength: 102400, description: "HTML email body; without it one is made from body and url." }
+
+    Targets:
+      type: object
+      additionalProperties: false
+      properties:
+        users:
+          type: array
+          maxItems: 100
+          description: "Push: the users whose registered devices get the message."
+          items: { type: string, minLength: 1, maxLength: 128 }
+        emails:
+          type: array
+          maxItems: 50
+          description: "Email: the recipients (instead of the email endpoint's own list)."
+          items: { type: string, format: email }
+        endpoints:
+          type: array
+          maxItems: 20
+          description: Only these endpoints get the event, among those subscribed to its type.
+          items: { type: string, pattern: "^ep_" }
+
+    EventIn:
+      type: object
+      additionalProperties: false
+      required: [type, payload]
+      properties:
+        type: { $ref: "#/components/schemas/EventType" }
+        tenant: { type: string, description: "The tenant's slug. Required with a key that is not bound to a tenant." }
+        payload: { type: object, description: "Sent to webhooks as `data`. At most 256 KB." }
+        message: { $ref: "#/components/schemas/Message" }
+        targets: { $ref: "#/components/schemas/Targets" }
+
+    Accepted:
+      type: object
+      required: [id, tenant, type, status, created_at]
+      properties:
+        id: { type: string, pattern: "^evt_" }
+        tenant: { type: string }
+        type: { type: string }
+        status: { type: string, enum: [accepted] }
+        created_at: { $ref: "#/components/schemas/Timestamp" }
+
+    Event:
+      type: object
+      required: [id, tenant, type, payload, message, targets, idempotency_key, created_at, routed_at, delivery_count]
+      properties:
+        id: { type: string, pattern: "^evt_" }
+        tenant: { type: string }
+        type: { type: string }
+        payload: { type: object }
+        message:
+          oneOf:
+            - { $ref: "#/components/schemas/Message" }
+            - { type: "null" }
+        targets:
+          oneOf:
+            - { $ref: "#/components/schemas/Targets" }
+            - { type: "null" }
+        idempotency_key: { type: [string, "null"] }
+        created_at: { $ref: "#/components/schemas/Timestamp" }
+        routed_at: { $ref: "#/components/schemas/NullableTimestamp" }
+        delivery_count: { type: integer, minimum: 0 }
+
+    EventWithDeliveries:
+      allOf:
+        - $ref: "#/components/schemas/Event"
+        - type: object
+          properties:
+            deliveries:
+              type: array
+              items: { $ref: "#/components/schemas/Delivery" }
+
+    EventList:
+      type: object
+      required: [data, next_cursor]
+      properties:
+        data: { type: array, items: { $ref: "#/components/schemas/Event" } }
+        next_cursor: { type: [string, "null"] }
+
+    DeliveryStatus:
+      type: string
+      enum: [pending, delivering, delivered, skipped, dead]
+      description: |
+        `pending` waits for its next attempt, `delivering` is being attempted, `delivered` succeeded,
+        `skipped` had nothing to send (a push user without devices), `dead` is in the dead-letter queue.
+
+    Delivery:
+      type: object
+      required: [id, event_id, endpoint_id, channel, recipient, status, attempts, max_attempts, next_attempt_at,
+        last_status_code, last_error, last_latency_ms, dead_reason, replay_of, replayed_at, created_at, completed_at]
+      properties:
+        id: { type: string, pattern: "^dlv_" }
+        event_id: { type: string, pattern: "^evt_" }
+        endpoint_id: { type: string, pattern: "^ep_" }
+        channel: { $ref: "#/components/schemas/Channel" }
+        recipient: { type: [string, "null"], description: "The email address or user ID (email and push)." }
+        status: { $ref: "#/components/schemas/DeliveryStatus" }
+        attempts: { type: integer, minimum: 0 }
+        max_attempts: { type: integer, minimum: 1 }
+        next_attempt_at: { $ref: "#/components/schemas/NullableTimestamp" }
+        last_status_code: { type: [integer, "null"] }
+        last_error: { type: [string, "null"] }
+        last_latency_ms: { type: [integer, "null"] }
+        dead_reason:
+          type: [string, "null"]
+          description: "`max_attempts`, `endpoint_gone`, `endpoint_disabled`, `rejected`; for skipped deliveries `no_devices` or `no_message`."
+        replay_of: { type: [string, "null"], description: "The dead delivery this one replays." }
+        replayed_at: { $ref: "#/components/schemas/NullableTimestamp" }
+        created_at: { $ref: "#/components/schemas/Timestamp" }
+        completed_at: { $ref: "#/components/schemas/NullableTimestamp" }
+
+    Attempt:
+      type: object
+      required: [attempt, started_at, latency_ms, status_code, error, response_body, outcome]
+      properties:
+        attempt: { type: integer, minimum: 1 }
+        started_at: { $ref: "#/components/schemas/Timestamp" }
+        latency_ms: { type: integer, minimum: 0 }
+        status_code: { type: [integer, "null"] }
+        error: { type: [string, "null"] }
+        response_body: { type: [string, "null"], description: "The first kilobyte of the receiver's answer." }
+        outcome: { type: string, enum: [delivered, retry, dead, skipped] }
+
+    DeliveryWithAttempts:
+      allOf:
+        - $ref: "#/components/schemas/Delivery"
+        - type: object
+          required: [attempt_log]
+          properties:
+            attempt_log:
+              type: array
+              items: { $ref: "#/components/schemas/Attempt" }
+
+    DeliveryList:
+      type: object
+      required: [data, next_cursor]
+      properties:
+        data: { type: array, items: { $ref: "#/components/schemas/Delivery" } }
+        next_cursor: { type: [string, "null"] }
+
+    Channel:
+      type: string
+      enum: [webhook, email, push]
+
+    EndpointIn:
+      type: object
+      additionalProperties: false
+      required: [channel]
+      properties:
+        channel: { $ref: "#/components/schemas/Channel" }
+        description: { type: string, maxLength: 500 }
+        url: { type: string, format: uri, maxLength: 2048, description: "Webhook only. Must be reachable on the public internet." }
+        email_to:
+          type: array
+          maxItems: 50
+          description: Email only. Recipients when an event names none.
+          items: { type: string, format: email }
+        max_in_flight: { type: integer, minimum: 1, maximum: 64, default: 4, description: "Concurrent attempts to this endpoint." }
+        event_types: { $ref: "#/components/schemas/EventTypes" }
+
+    EndpointPatch:
+      type: object
+      additionalProperties: false
+      properties:
+        description: { type: string, maxLength: 500 }
+        url: { type: string, format: uri, maxLength: 2048 }
+        email_to: { type: array, maxItems: 50, items: { type: string, format: email } }
+        max_in_flight: { type: integer, minimum: 1, maximum: 64 }
+
+    Endpoint:
+      type: object
+      required: [id, channel, description, url, email_to, max_in_flight, status, disabled_reason, disabled_at,
+        failure_streak, failing_since, created_at, updated_at]
+      properties:
+        id: { type: string, pattern: "^ep_" }
+        channel: { $ref: "#/components/schemas/Channel" }
+        description: { type: string }
+        url: { type: [string, "null"] }
+        email_to: { type: array, items: { type: string } }
+        max_in_flight: { type: integer }
+        status: { type: string, enum: [active, disabled] }
+        disabled_reason: { type: [string, "null"] }
+        disabled_at: { $ref: "#/components/schemas/NullableTimestamp" }
+        failure_streak: { type: integer, minimum: 0, description: "Failed attempts in a row." }
+        failing_since: { $ref: "#/components/schemas/NullableTimestamp" }
+        created_at: { $ref: "#/components/schemas/Timestamp" }
+        updated_at: { $ref: "#/components/schemas/Timestamp" }
+        secret: { type: string, pattern: "^whsec_", description: "Only when the endpoint is created and when its secret is rotated." }
+
+    EndpointList:
+      type: object
+      required: [data, next_cursor]
+      properties:
+        data: { type: array, items: { $ref: "#/components/schemas/Endpoint" } }
+        next_cursor: { type: [string, "null"] }
+
+    SubscriptionIn:
+      type: object
+      additionalProperties: false
+      required: [endpoint_id, event_types]
+      properties:
+        endpoint_id: { type: string, pattern: "^ep_" }
+        event_types: { $ref: "#/components/schemas/EventTypes" }
+
+    Subscription:
+      type: object
+      required: [id, endpoint_id, event_types, created_at]
+      properties:
+        id: { type: string, pattern: "^sub_" }
+        endpoint_id: { type: string, pattern: "^ep_" }
+        event_types: { type: array, items: { type: string } }
+        created_at: { $ref: "#/components/schemas/Timestamp" }
+
+    SubscriptionList:
+      type: object
+      required: [data, next_cursor]
+      properties:
+        data: { type: array, items: { $ref: "#/components/schemas/Subscription" } }
+        next_cursor: { type: [string, "null"] }
+
+    PushTokenIn:
+      type: object
+      additionalProperties: false
+      required: [user, token]
+      properties:
+        user: { type: string, minLength: 1, maxLength: 128 }
+        token: { type: string, pattern: "^Expo(nent)?PushToken\\[.+\\]$" }
+        platform: { type: string, enum: [ios, android, web] }
+
+    PushToken:
+      type: object
+      required: [id, user, token, platform, created_at, last_used_at]
+      properties:
+        id: { type: string, pattern: "^ptk_" }
+        user: { type: string }
+        token: { type: string }
+        platform: { type: string }
+        created_at: { $ref: "#/components/schemas/Timestamp" }
+        last_used_at: { $ref: "#/components/schemas/NullableTimestamp" }
+
+    PushTokenList:
+      type: object
+      required: [data, next_cursor]
+      properties:
+        data: { type: array, items: { $ref: "#/components/schemas/PushToken" } }
+        next_cursor: { type: [string, "null"] }
+
+    Limits:
+      type: object
+      additionalProperties: false
+      properties:
+        ingest_rate: { type: integer, minimum: 1, maximum: 100000, description: "Events per second (default 100)." }
+        ingest_burst: { type: integer, minimum: 1, maximum: 100000, description: "Burst above the rate (default 200)." }
+        delivery_rate: { type: integer, minimum: 1, maximum: 10000, description: "Delivery attempts per second (default 50)." }
+        max_in_flight: { type: integer, minimum: 1, maximum: 1000, description: "Concurrent attempts across the tenant's endpoints (default 16)." }
+
+    TenantIn:
+      type: object
+      additionalProperties: false
+      required: [slug, name]
+      properties:
+        slug: { type: string, pattern: "^[a-z0-9][a-z0-9_-]{0,62}$", description: "Your own ID for the tenant, used in URLs and events." }
+        name: { type: string, minLength: 1, maxLength: 200 }
+        limits: { $ref: "#/components/schemas/Limits" }
+
+    TenantPatch:
+      type: object
+      additionalProperties: false
+      properties:
+        name: { type: string, minLength: 1, maxLength: 200 }
+        limits: { $ref: "#/components/schemas/Limits" }
+        disabled: { type: boolean }
+
+    Tenant:
+      type: object
+      required: [id, slug, name, limits, disabled, disabled_at, created_at, updated_at]
+      properties:
+        id: { type: string, pattern: "^ten_" }
+        slug: { type: string }
+        name: { type: string }
+        limits:
+          type: object
+          required: [ingest_rate, ingest_burst, delivery_rate, max_in_flight]
+          properties:
+            ingest_rate: { type: integer }
+            ingest_burst: { type: integer }
+            delivery_rate: { type: integer }
+            max_in_flight: { type: integer }
+        disabled: { type: boolean }
+        disabled_at: { $ref: "#/components/schemas/NullableTimestamp" }
+        created_at: { $ref: "#/components/schemas/Timestamp" }
+        updated_at: { $ref: "#/components/schemas/Timestamp" }
+
+    TenantList:
+      type: object
+      required: [data, next_cursor]
+      properties:
+        data: { type: array, items: { $ref: "#/components/schemas/Tenant" } }
+        next_cursor: { type: [string, "null"] }
+
+    Scope:
+      type: string
+      enum: [ingest, read, manage, admin]
+
+    KeyIn:
+      type: object
+      additionalProperties: false
+      required: [name]
+      properties:
+        name: { type: string, minLength: 1, maxLength: 100 }
+        scopes:
+          type: array
+          minItems: 1
+          description: "Defaults to ingest, read and manage. `admin` only on keys that are not bound to a tenant."
+          items: { $ref: "#/components/schemas/Scope" }
+
+    APIKey:
+      type: object
+      required: [id, name, tenant, prefix, scopes, created_at, last_used_at, revoked_at]
+      properties:
+        id: { type: string, pattern: "^key_" }
+        name: { type: string }
+        tenant: { type: [string, "null"], description: "The tenant's slug, or null for a key that works for every tenant." }
+        prefix: { type: string, description: "The first characters of the key, to recognize it." }
+        scopes: { type: array, items: { $ref: "#/components/schemas/Scope" } }
+        created_at: { $ref: "#/components/schemas/Timestamp" }
+        last_used_at: { $ref: "#/components/schemas/NullableTimestamp" }
+        revoked_at: { $ref: "#/components/schemas/NullableTimestamp" }
+        key: { type: string, pattern: "^rk_", description: "The full key. Only in the response that creates it." }
+
+    KeyList:
+      type: object
+      required: [data, next_cursor]
+      properties:
+        data: { type: array, items: { $ref: "#/components/schemas/APIKey" } }
+        next_cursor: { type: [string, "null"] }
+
+    Health:
+      type: object
+      required: [status, version, commit]
+      properties:
+        status: { type: string, enum: [ok, degraded] }
+        version: { type: string }
+        commit: { type: string }
+        checks:
+          type: object
+          additionalProperties: { type: string }

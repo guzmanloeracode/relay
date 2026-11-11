@@ -1,0 +1,40 @@
+version: "2"
+run:
+  timeout: 5m
+  tests: true
+linters:
+  default: standard
+  enable:
+    - bodyclose
+    - errorlint
+    - gosec
+    - misspell
+    - noctx
+    - revive
+    - unconvert
+    - usestdlibvars
+  settings:
+    gosec:
+      excludes:
+        - G104 # unchecked errors are covered by errcheck where they matter
+        - G115 # int conversions are bounded by validation
+    revive:
+      rules:
+        - name: exported
+          arguments: [disableStutteringCheck]
+    errcheck:
+      exclude-functions:
+        - (net/http.ResponseWriter).Write
+  exclusions:
+    generated: lax
+    presets: [comments, std-error-handling]
+    paths:
+      - internal/store/db
+    rules:
+      - path: _test\.go
+        linters: [gosec, noctx, bodyclose, errcheck, revive]
+formatters:
+  enable: [gofmt, goimports]
+  settings:
+    goimports:
+      local-prefixes: [github.com/guzmanloeracode/relay]

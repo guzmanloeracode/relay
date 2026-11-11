@@ -1,0 +1,5 @@
+/bin/
+.env
+*.out
+/loadtest/results/*/
+!/loadtest/results/README.md

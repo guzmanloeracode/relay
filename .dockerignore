@@ -1,0 +1,7 @@
+.git
+*.md
+!README.md
+docs
+loadtest/results
+deploy/*.env
+.env

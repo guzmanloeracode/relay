@@ -1,0 +1,159 @@
+# Relay's full stack: PostgreSQL, Redis, migrations, the API and the worker. The same file runs locally and in
+# production; settings come from .env (see .env.example) or `--env-file`.
+#
+#   docker compose up -d --build                       # the stack on http://localhost:8080
+#   docker compose --profile observability up -d       # plus Prometheus, Grafana and Jaeger
+#   docker compose up -d --scale worker=3              # more workers
+name: relay
+
+x-common: &common
+  restart: unless-stopped
+  security_opt: ["no-new-privileges:true"]
+  logging:
+    driver: local
+    options: { max-size: "10m", max-file: "3" }
+
+x-relay: &relay
+  <<: *common
+  image: relay:${TAG:-dev}
+  build:
+    context: .
+    args:
+      VERSION: ${VERSION:-dev}
+      COMMIT: ${COMMIT:-local}
+  read_only: true
+  cap_drop: [ALL]
+  environment: &relay-env
+    DATABASE_URL: postgres://relay:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}@postgres:5432/relay
+    REDIS_URL: redis://:${REDIS_PASSWORD:?set REDIS_PASSWORD}@redis:6379/0
+    RELAY_SECRET_KEY: ${RELAY_SECRET_KEY:?set RELAY_SECRET_KEY (openssl rand -base64 32)}
+    RELAY_PUBLIC_URL: ${RELAY_PUBLIC_URL:-http://localhost:8080}
+    LOG_LEVEL: ${LOG_LEVEL:-info}
+    ALLOW_PRIVATE_NETWORKS: ${ALLOW_PRIVATE_NETWORKS:-false}
+    WORKER_CONCURRENCY: ${WORKER_CONCURRENCY:-64}
+    RETENTION: ${RETENTION:-720h}
+    EMAIL_PROVIDER: ${EMAIL_PROVIDER:-log}
+    EMAIL_FROM: ${EMAIL_FROM:-Relay <relay@example.com>}
+    RESEND_API_KEY: ${RESEND_API_KEY:-}
+    SMTP_URL: ${SMTP_URL:-}
+    EXPO_ACCESS_TOKEN: ${EXPO_ACCESS_TOKEN:-}
+    OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-}
+
+services:
+  postgres:
+    <<: *common
+    image: postgres:18-alpine
+    environment:
+      POSTGRES_USER: relay
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: relay
+    volumes:
+      - pgdata:/var/lib/postgresql
+    command: ["postgres", "-c", "shared_buffers=64MB", "-c", "max_connections=120", "-c", "log_min_duration_statement=500"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U relay -d relay"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    mem_limit: 256m
+    cpus: ${PG_CPUS:-1.0}
+
+  redis:
+    <<: *common
+    image: redis:8.10-alpine
+    # Append-only file for durability of queued IDs; PostgreSQL stays the source of truth either way.
+    command: ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec", "--save", "",
+              "--maxmemory", "96mb", "--maxmemory-policy", "noeviction", "--requirepass", "${REDIS_PASSWORD}"]
+    environment:
+      REDISCLI_AUTH: ${REDIS_PASSWORD}
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    mem_limit: 128m
+    cpus: ${REDIS_CPUS:-0.5}
+
+  migrate:
+    <<: *relay
+    restart: "no"
+    command: ["migrate"]
+    depends_on:
+      postgres: { condition: service_healthy }
+
+  api:
+    <<: *relay
+    command: ["api"]
+    ports:
+      - "127.0.0.1:${RELAY_PORT:-8080}:8080"
+    depends_on:
+      migrate: { condition: service_completed_successfully }
+      redis: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/relay", "healthcheck"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    mem_limit: 128m
+    cpus: ${API_CPUS:-1.0}
+
+  worker:
+    <<: *relay
+    command: ["worker"]
+    depends_on:
+      migrate: { condition: service_completed_successfully }
+      redis: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/relay", "healthcheck", "http://127.0.0.1:9091/metrics"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    stop_grace_period: 40s # SHUTDOWN_TIMEOUT (30 s) plus margin: attempts in progress finish
+    mem_limit: 192m
+    cpus: ${WORKER_CPUS:-1.0}
+
+  # --- docker compose --profile observability up -d ---
+  prometheus:
+    <<: *common
+    profiles: [observability]
+    image: prom/prometheus:v3.16.0
+    command: ["--config.file=/etc/prometheus/prometheus.yml", "--storage.tsdb.retention.time=7d"]
+    volumes:
+      - ./deploy/observability/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - promdata:/prometheus
+    ports:
+      - "127.0.0.1:${PROMETHEUS_PORT:-9090}:9090"
+    mem_limit: 256m
+
+  grafana:
+    <<: *common
+    profiles: [observability]
+    image: grafana/grafana:13.0.13
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-admin}
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/relay.json
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_NEWS_NEWS_FEED_ENABLED: "false"
+    volumes:
+      - ./deploy/observability/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./deploy/observability/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    ports:
+      - "127.0.0.1:${GRAFANA_PORT:-3300}:3000"
+    mem_limit: 256m
+
+  jaeger:
+    <<: *common
+    profiles: [observability]
+    image: jaegertracing/jaeger:2.22.0
+    ports:
+      - "127.0.0.1:${JAEGER_PORT:-16686}:16686"
+    mem_limit: 256m
+
+volumes:
+  pgdata:
+  redisdata:
+  promdata:

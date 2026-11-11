@@ -1,0 +1,26 @@
+# Load-test overlay for compose.yaml: Relay's four services share CPUs 2 and 3 (a 2-vCPU machine); the load
+# generator, the sink and the monitoring run on CPUs 0 and 1 so they don't take Relay's CPU time.
+services:
+  postgres: { cpuset: "2,3" }
+  redis: { cpuset: "2,3" }
+  migrate: { cpuset: "2,3" }
+  api: { cpuset: "2,3" }
+  worker: { cpuset: "2,3" }
+  prometheus: { cpuset: "0,1" }
+  grafana: { cpuset: "0,1" }
+  sink:
+    image: relay:${TAG:-dev}
+    command: ["sink", ":8090"]
+    read_only: true
+    cpuset: "0,1"
+    ports: ["127.0.0.1:${SINK_PORT:-18190}:8090"]
+  k6:
+    image: grafana/k6:1.8.2
+    profiles: [k6]
+    cpuset: "0,1"
+    volumes:
+      - ./loadtest:/scripts:ro
+      - ${RESULTS_DIR:-./loadtest/results}:/results
+    environment:
+      RATE: ${RATE:-600}
+      DURATION: ${DURATION:-2m}
