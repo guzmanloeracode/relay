@@ -48,8 +48,16 @@ type Worker struct {
 	// Webhook endpoints whose failure streak is known to be zero (saves a write per delivered webhook).
 	healthy *cache.Cache[uuid.UUID, bool]
 
+	recorder *recorder
+
 	inflight sync.WaitGroup
 }
+
+// The recorder's flushers write attempt results in parallel batches of up to recorderBatch.
+const (
+	recorderFlushers = 4
+	recorderBatch    = 128
+)
 
 // Options lets tests replace the channel senders.
 type Options struct {
@@ -84,6 +92,7 @@ func New(cfg config.Config, st *store.Store, q *queue.Queue, log *slog.Logger, m
 		channels.Push: &push.Sender{Store: st.Queries, Expo: w.expo, ReceiptDelay: cfg.PushReceiptAge,
 			OnPruned: func(n int) { m.PushTokensPruned.Add(float64(n)) }},
 	}
+	w.recorder = newRecorder(st, log, recorderFlushers, recorderBatch)
 	for ch, s := range opts.Senders {
 		w.senders[ch] = s
 	}
@@ -113,6 +122,7 @@ func (w *Worker) Run(ctx context.Context) error {
 	// Attempts keep their own context: cancelling ctx stops new work, not the requests already on the wire.
 	workCtx, cancelWork := context.WithCancel(context.WithoutCancel(ctx))
 	defer cancelWork()
+	w.recorder.run(workCtx, recorderFlushers)
 
 	var loops sync.WaitGroup
 	start := func(name string, fn func(context.Context)) {

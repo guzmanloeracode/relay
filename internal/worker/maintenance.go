@@ -63,13 +63,15 @@ func (w *Worker) Sweep(ctx context.Context) {
 	}
 	if msgs, err := w.q.Reclaim(ctx, queue.DeliveriesStream, queue.WorkerGroup, w.consumer, minIdle, 100); err == nil && len(msgs) > 0 {
 		w.m.Requeued.WithLabelValues("reclaimed").Add(float64(len(msgs)))
-		for _, m := range msgs {
-			w.inflight.Add(1)
-			go func() {
-				defer w.inflight.Done()
-				w.handle(context.WithoutCancel(ctx), m)
-			}()
+		slots := make(chan struct{}, len(msgs)) // these attempts come on top of the delivery loop's own
+		for range msgs {
+			slots <- struct{}{}
 		}
+		w.inflight.Add(1)
+		go func() {
+			defer w.inflight.Done()
+			w.dispatch(context.WithoutCancel(ctx), msgs, slots)
+		}()
 	}
 }
 

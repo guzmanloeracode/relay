@@ -206,6 +206,45 @@ func (q *Queue) Acquire(ctx context.Context, it Item, l Limits, lease time.Durat
 	return Verdict(res[0]), nil
 }
 
+// AcquireMany runs Acquire for several deliveries in one round trip to Redis.
+func (q *Queue) AcquireMany(ctx context.Context, items []Item, limits []Limits, lease time.Duration) ([]Verdict, error) {
+	run := func() ([]*redis.Cmd, error) {
+		cmds := make([]*redis.Cmd, len(items))
+		_, err := q.rdb.Pipelined(ctx, func(p redis.Pipeliner) error {
+			for i, it := range items {
+				l := limits[i]
+				keys := []string{
+					semKey("e", it.Endpoint), semKey("t", it.Tenant), parkKey("e", it.Endpoint), parkKey("t", it.Tenant),
+					parkedIndexKey, bucketKey("deliver", it.Tenant), delayedKey,
+				}
+				cmds[i] = acquireScript.EvalSha(ctx, p, keys, it.Delivery.String(), it.String(), lease.Milliseconds(),
+					l.EndpointInFlight, l.TenantInFlight, l.Rate.Rate, l.Rate.Burst)
+			}
+			return nil
+		})
+		return cmds, err
+	}
+	cmds, err := run()
+	if err != nil && strings.HasPrefix(err.Error(), "NOSCRIPT") { // Redis restarted: load the script once
+		if err := acquireScript.Load(ctx, q.rdb).Err(); err != nil {
+			return nil, err
+		}
+		cmds, err = run()
+	}
+	if err != nil {
+		return nil, err
+	}
+	out := make([]Verdict, len(cmds))
+	for i, c := range cmds {
+		res, err := c.Int64Slice()
+		if err != nil {
+			return nil, err
+		}
+		out[i] = Verdict(res[0])
+	}
+	return out, nil
+}
+
 // Release frees the slots taken by Acquire and wakes one parked delivery of the endpoint and one of the tenant.
 func (q *Queue) Release(ctx context.Context, it Item) error {
 	keys := []string{

@@ -371,7 +371,7 @@ func (q *Queries) ListEventDeliveries(ctx context.Context, arg ListEventDeliveri
 	return items, nil
 }
 
-const loadDelivery = `-- name: LoadDelivery :one
+const loadDeliveries = `-- name: LoadDeliveries :many
 SELECT d.id, d.tenant_id, d.event_id, d.endpoint_id, d.channel, d.recipient, d.attempts, d.max_attempts,
        ev.type AS event_type, ev.payload, ev.message, ev.created_at AS event_created_at,
        en.url, en.secret_enc, en.previous_secret_enc, en.previous_secret_expires_at, en.email_to,
@@ -380,13 +380,13 @@ FROM deliveries d
 JOIN events ev ON ev.id = d.event_id
 JOIN endpoints en ON en.id = d.endpoint_id
 JOIN tenants t ON t.id = d.tenant_id
-WHERE d.id = $1
+WHERE d.id = ANY($1::uuid[])
   AND d.status = 'pending'
   AND d.next_attempt_at <= now() + interval '2 seconds'
   AND en.status = 'active'
 `
 
-type LoadDeliveryRow struct {
+type LoadDeliveriesRow struct {
 	ID                      uuid.UUID
 	TenantID                uuid.UUID
 	EventID                 uuid.UUID
@@ -407,88 +407,118 @@ type LoadDeliveryRow struct {
 	TenantSlug              string
 }
 
-// Reads a due delivery for an attempt. A message for a delivery that is done or not due yet (a stale
-// duplicate) matches nothing, which makes queue redelivery harmless. The worker holds the delivery's slot in
-// Redis while it attempts; the result is written once, by RecordAttempt.
-func (q *Queries) LoadDelivery(ctx context.Context, id uuid.UUID) (LoadDeliveryRow, error) {
-	row := q.db.QueryRow(ctx, loadDelivery, id)
-	var i LoadDeliveryRow
-	err := row.Scan(
-		&i.ID,
-		&i.TenantID,
-		&i.EventID,
-		&i.EndpointID,
-		&i.Channel,
-		&i.Recipient,
-		&i.Attempts,
-		&i.MaxAttempts,
-		&i.EventType,
-		&i.Payload,
-		&i.Message,
-		&i.EventCreatedAt,
-		&i.Url,
-		&i.SecretEnc,
-		&i.PreviousSecretEnc,
-		&i.PreviousSecretExpiresAt,
-		&i.EmailTo,
-		&i.TenantSlug,
-	)
-	return i, err
+// LoadDelivery for a batch of queue entries.
+func (q *Queries) LoadDeliveries(ctx context.Context, ids []uuid.UUID) ([]LoadDeliveriesRow, error) {
+	rows, err := q.db.Query(ctx, loadDeliveries, ids)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []LoadDeliveriesRow{}
+	for rows.Next() {
+		var i LoadDeliveriesRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.TenantID,
+			&i.EventID,
+			&i.EndpointID,
+			&i.Channel,
+			&i.Recipient,
+			&i.Attempts,
+			&i.MaxAttempts,
+			&i.EventType,
+			&i.Payload,
+			&i.Message,
+			&i.EventCreatedAt,
+			&i.Url,
+			&i.SecretEnc,
+			&i.PreviousSecretEnc,
+			&i.PreviousSecretExpiresAt,
+			&i.EmailTo,
+			&i.TenantSlug,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
 }
 
-const recordAttempt = `-- name: RecordAttempt :execrows
-WITH upd AS (
+const recordAttempts = `-- name: RecordAttempts :many
+WITH r AS (
+    SELECT unnest($1::uuid[]) AS id, unnest($2::int[]) AS seen,
+           unnest($3::text[]) AS outcome, unnest($4::timestamptz[]) AS next_at,
+           unnest($5::timestamptz[]) AS started_at, unnest($6::int[]) AS latency,
+           unnest($7::int[]) AS status_code, unnest($8::text[]) AS err,
+           unnest($9::text[]) AS body, unnest($10::text[]) AS dead_reason
+), upd AS (
     UPDATE deliveries d SET
-        status           = CASE $6::text WHEN 'retry' THEN 'pending' ELSE $6::text END,
+        status           = CASE r.outcome WHEN 'retry' THEN 'pending' ELSE r.outcome END,
         attempts         = d.attempts + 1,
-        next_attempt_at  = $7::timestamptz,
-        last_status_code = $3::int,
-        last_error       = $4::text,
-        last_latency_ms  = $2::int,
-        dead_reason      = $8::text,
-        completed_at     = CASE $6::text WHEN 'retry' THEN NULL ELSE now() END
-    WHERE d.id = $9 AND d.status = 'pending' AND d.attempts = $10::int
+        next_attempt_at  = r.next_at,
+        last_status_code = NULLIF(r.status_code, 0),
+        last_error       = NULLIF(r.err, ''),
+        last_latency_ms  = r.latency,
+        dead_reason      = NULLIF(r.dead_reason, ''),
+        completed_at     = CASE r.outcome WHEN 'retry' THEN NULL ELSE now() END
+    FROM r
+    WHERE d.id = r.id AND d.status = 'pending' AND d.attempts = r.seen
     RETURNING d.id, d.attempts
+), ins AS (
+    INSERT INTO delivery_attempts (delivery_id, attempt, started_at, latency_ms, status_code, error, response_body, outcome)
+    SELECT upd.id, upd.attempts, r.started_at, r.latency, NULLIF(r.status_code, 0), NULLIF(r.err, ''), NULLIF(r.body, ''), r.outcome
+    FROM upd JOIN r ON r.id = upd.id
 )
-INSERT INTO delivery_attempts (delivery_id, attempt, started_at, latency_ms, status_code, error, response_body, outcome)
-SELECT upd.id, upd.attempts, $1::timestamptz, $2::int,
-       $3::int, $4::text, $5::text, $6::text
-FROM upd
+SELECT upd.id FROM upd
 `
 
-type RecordAttemptParams struct {
-	StartedAt     time.Time
-	LatencyMs     int32
-	StatusCode    *int32
-	Error         *string
-	ResponseBody  *string
-	Outcome       string
-	NextAttemptAt time.Time
-	DeadReason    *string
-	ID            uuid.UUID
-	SeenAttempts  int32
+type RecordAttemptsParams struct {
+	Ids         []uuid.UUID
+	Seen        []int32
+	Outcomes    []string
+	NextAt      []time.Time
+	StartedAt   []time.Time
+	Latencies   []int32
+	StatusCodes []int32
+	Errors      []string
+	Bodies      []string
+	DeadReasons []string
 }
 
-// Records one attempt and the delivery's next state in one statement. It only applies if nobody recorded an
-// attempt since the delivery was loaded (attempts unchanged), so a duplicate attempt never counts twice.
-// outcome 'retry' keeps the delivery pending until next_attempt_at.
-func (q *Queries) RecordAttempt(ctx context.Context, arg RecordAttemptParams) (int64, error) {
-	result, err := q.db.Exec(ctx, recordAttempt,
+// RecordAttempt for a batch: returns the deliveries it applied to (the others were recorded by someone else).
+// Zero and empty strings stand for NULL in status codes, errors, bodies and reasons.
+func (q *Queries) RecordAttempts(ctx context.Context, arg RecordAttemptsParams) ([]uuid.UUID, error) {
+	rows, err := q.db.Query(ctx, recordAttempts,
+		arg.Ids,
+		arg.Seen,
+		arg.Outcomes,
+		arg.NextAt,
 		arg.StartedAt,
-		arg.LatencyMs,
-		arg.StatusCode,
-		arg.Error,
-		arg.ResponseBody,
-		arg.Outcome,
-		arg.NextAttemptAt,
-		arg.DeadReason,
-		arg.ID,
-		arg.SeenAttempts,
+		arg.Latencies,
+		arg.StatusCodes,
+		arg.Errors,
+		arg.Bodies,
+		arg.DeadReasons,
 	)
 	if err != nil {
-		return 0, err
+		return nil, err
 	}
-	return result.RowsAffected(), nil
+	defer rows.Close()
+	items := []uuid.UUID{}
+	for rows.Next() {
+		var id uuid.UUID
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		items = append(items, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
 }
 
 const replayDeadLetters = `-- name: ReplayDeadLetters :many
