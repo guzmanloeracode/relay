@@ -36,3 +36,7 @@ a delivery log.
   test on two pinned CPUs.
 - **API reference** at `/docs` from the OpenAPI 3.1 document at `/openapi.yaml`, which the integration tests
   enforce on every response.
+- **Performance:** events and their deliveries are stored in one transaction shared by concurrent requests (group
+  commit), and the worker loads and records deliveries in batches. With Relay on two pinned CPUs, k6 at 500
+  events a second for two minutes: every event accepted and delivered, signed and once, no backlog at the end,
+  ingest latency p50 21–34 ms and p99 187–281 ms ([load test report](docs/LOADTEST.md)).
